@@ -26,8 +26,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Set exit on failure
-set -e
-set -o pipefail
+# set -e
+# set -o pipefail
 
 # Define colors and bold formatting for messages
 COLOR_RESET="\033[0m"
@@ -41,11 +41,9 @@ RESET="\033[0m"
 
 # Functions for colored output
 info() {
-    TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S') # Current timestamp for logging
-    if [ "$NON_INTERACTIVE" = false ]; then
-        echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*" # Print info to console if interactive
-    fi
-    echo "$TIMESTAMP [INFO] $*" >>"$LOG_FILE" # Log info to the log file regardless
+    TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')         # Current timestamp for logging
+    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*" # Always print info to console
+    echo "$TIMESTAMP [INFO] $*" >>"$LOG_FILE"      # Log info to the log file
 }
 
 success() {
@@ -241,11 +239,14 @@ validate_env_var() {
     else
         echo "${var_name}=${var_value}" >>"$FIREFLY_INSTALL_DIR/.env"
     fi
+
+    # Indicate successful completion
+    return 0
 }
 
 # General countdown function with dynamic box size and padding for single digits
 countdown_timer() {
-    local SECONDS_LEFT=60
+    local SECONDS_LEFT=30
     local MESSAGE=$1
     local COLOR=$2
     local INPUT_RECEIVED=false
@@ -374,6 +375,9 @@ return_or_menu_prompt() {
         display_mode_options
         ;;
     esac
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to run test mode with a countdown and menu
@@ -464,21 +468,40 @@ display_menu() {
         display_mode_options
         ;;
     esac
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to determine the latest available PHP version from apt repositories
 get_latest_php_version() {
     # Fetch the list of PHP versions available via apt-cache and filter valid PHP version formats
+    local php_versions
+    php_versions=$(apt-cache madison php | awk '{print $3}' | grep -oP '^\d+\.\d+' | sort -V | uniq)
+
+    # Filter out RC and beta versions dynamically
+    local stable_php_versions=()
+    for version in $php_versions; do
+        # Check if the version is a stable release (e.g., does not contain 'alpha', 'beta', 'RC')
+        if [[ ! "$version" =~ (alpha|beta|RC) ]]; then
+            stable_php_versions+=("$version")
+        fi
+    done
+
+    # Get the highest stable PHP version
     local php_version
-    php_version=$(apt-cache pkgnames | grep -oP '^php\d+\.\d+$' | sort -V | tail -n 1 | grep -oP '\d+\.\d+')
+    php_version=$(printf '%s\n' "${stable_php_versions[@]}" | sort -V | tail -n 1)
 
     # Check if a valid PHP version was found
     if [ -z "$php_version" ]; then
-        error "No valid PHP version found in the apt repositories."
+        error "No valid stable PHP version found in the apt repositories."
         return 1
     else
         echo "$php_version"
     fi
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to fetch release info from GitHub API with rate limiting
@@ -518,6 +541,9 @@ fetch_release_info() {
 
     # Parse the API response and return the JSON data
     cat headers.txt
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to get the latest release download URL from GitHub using jq
@@ -530,10 +556,13 @@ get_latest_release_url() {
     # Check if the rate limit has been exceeded
     if echo "$release_info" | grep -q "API rate limit exceeded"; then
         error "GitHub API rate limit exceeded. Please try again later or use a GitHub API token."
-        exit 1
+        return 1
     fi
 
     echo "$release_info" | jq -r --arg file_pattern "$file_pattern" '.assets[] | select(.name | test($file_pattern)) | .browser_download_url' | head -n1
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to download and validate a release
@@ -547,14 +576,14 @@ download_and_validate_release() {
         info "Creating directory $dest_dir..."
         if ! mkdir -p "$dest_dir"; then
             error "Failed to create directory $dest_dir. Please check your permissions."
-            exit 1
+            return 1
         fi
     fi
 
     # Check if the directory is writable
     if [ ! -w "$dest_dir" ]; then
         error "The directory $dest_dir is not writable. Please check permissions and try again."
-        exit 1
+        return 1
     fi
 
     info "Downloading the latest release of $repo..."
@@ -659,21 +688,32 @@ extract_archive() {
     success "Extraction of $archive_file into $dest_dir completed successfully."
 }
 
-# Function to create and populate the .env file or validate if it doesn't exist
+# Function to validate or create .env file for Firefly III
+# Accepts the directory (either $FIREFLY_INSTALL_DIR or $FIREFLY_TEMP_DIR) as an argument
 setup_env_file() {
-    if [ ! -f "$FIREFLY_INSTALL_DIR/.env" ]; then
+    local target_dir="$1"
+
+    if [ ! -f "$target_dir/.env" ]; then
         info "No .env file found, using .env.example as a template."
 
-        # Only copy .env.example to .env if .env does not already exist
-        cp "$FIREFLY_INSTALL_DIR/.env.example" "$FIREFLY_INSTALL_DIR/.env"
-        info "Created new .env file from .env.example."
+        # Search for the .env.example file in case it's not in the expected location
+        env_example_path=$(find "$target_dir" -name ".env.example" -print -quit)
+
+        if [ -n "$env_example_path" ]; then
+            # Copy the .env.example to .env
+            cp "$env_example_path" "$target_dir/.env"
+            info "Created new .env file from .env.example."
+        else
+            error ".env.example not found. Ensure the example file is present."
+            return 1
+        fi
     else
         info ".env file already exists. Validating required environment variables..."
     fi
 
     # Set ownership and permissions for the .env file
-    chown www-data:www-data "$FIREFLY_INSTALL_DIR/.env" # Set the owner to www-data
-    chmod 640 "$FIREFLY_INSTALL_DIR/.env"               # Set secure permissions for the .env file (readable by www-data)
+    chown www-data:www-data "$target_dir/.env" # Set the owner to www-data
+    chmod 640 "$target_dir/.env"               # Set secure permissions for the .env file
 
     # Ask the user which database to use
     if [ "$NON_INTERACTIVE" = true ]; then
@@ -689,17 +729,17 @@ setup_env_file() {
         # Use SQLite
         info "Configuring SQLite database..."
         # Update .env file to use SQLite
-        sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' "$FIREFLY_INSTALL_DIR/.env"
-        sed -i '/DB_HOST/d' "$FIREFLY_INSTALL_DIR/.env"
-        sed -i '/DB_PORT/d' "$FIREFLY_INSTALL_DIR/.env"
-        sed -i '/DB_DATABASE/d' "$FIREFLY_INSTALL_DIR/.env"
-        sed -i '/DB_USERNAME/d' "$FIREFLY_INSTALL_DIR/.env"
-        sed -i '/DB_PASSWORD/d' "$FIREFLY_INSTALL_DIR/.env"
+        sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' "$target_dir/.env"
+        sed -i '/DB_HOST/d' "$target_dir/.env"
+        sed -i '/DB_PORT/d' "$target_dir/.env"
+        sed -i '/DB_DATABASE/d' "$target_dir/.env"
+        sed -i '/DB_USERNAME/d' "$target_dir/.env"
+        sed -i '/DB_PASSWORD/d' "$target_dir/.env"
 
         # Create SQLite database file
-        mkdir -p "$FIREFLY_INSTALL_DIR/storage/database"
-        touch "$FIREFLY_INSTALL_DIR/storage/database/database.sqlite"
-        chown -R www-data:www-data "$FIREFLY_INSTALL_DIR/storage/database"
+        mkdir -p "$target_dir/storage/database"
+        touch "$target_dir/storage/database/database.sqlite"
+        chown -R www-data:www-data "$target_dir/storage/database"
     else
         # Use MySQL
         info "Configuring MySQL database..."
@@ -775,6 +815,9 @@ setup_env_file() {
     setup_cron_job
 
     success ".env file validated and populated successfully."
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to create MySQL database
@@ -790,10 +833,11 @@ create_mysql_db() {
         fi
     fi
 
-    # Assign MYSQL_ROOT_AUTH based on MYSQL_ROOT_PASS
+    # Assign MYSQL_ROOT_CMD based on MYSQL_ROOT_PASS
     if [ -z "$MYSQL_ROOT_PASS" ]; then
         info "Using unix_socket authentication for MySQL root access."
-        MYSQL_ROOT_CMD=("sudo" "mysql")
+        # Remove 'sudo' since we're already running as root
+        MYSQL_ROOT_CMD=("mysql")
     else
         MYSQL_ROOT_CMD=("mysql" "-u" "root" "-p$MYSQL_ROOT_PASS")
     fi
@@ -804,7 +848,7 @@ create_mysql_db() {
     # Attempt to connect to MySQL and handle connection errors
     if ! echo "SELECT 1;" | "${MYSQL_ROOT_CMD[@]}" &>/dev/null; then
         error "Failed to connect to MySQL. Please check your MySQL root credentials or server status."
-        exit 1
+        return 1
     fi
 
     # Check if the database exists
@@ -815,11 +859,13 @@ create_mysql_db() {
         # Create the database
         echo "CREATE DATABASE $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" | "${MYSQL_ROOT_CMD[@]}" || {
             error "Failed to create database '$DB_NAME'. Please check your MySQL setup."
-            exit 1
+            return 1
         }
         success "Database '$DB_NAME' created successfully."
     fi
 
+    # Indicate successful completion
+    return 0
 }
 
 # Function to create MySQL user
@@ -831,15 +877,18 @@ create_mysql_user() {
         info "Creating MySQL user '$DB_USER'..."
         if ! echo "CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';" | "${MYSQL_ROOT_CMD[@]}"; then
             error "Failed to create MySQL user '$DB_USER'. Please check if the user already exists or if the credentials are correct."
-            exit 1
+            return 1
         fi
 
         if ! echo "GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;" | "${MYSQL_ROOT_CMD[@]}"; then
             error "Failed to grant privileges to MySQL user '$DB_USER'. Please check your MySQL permissions."
-            exit 1
+            return 1
         fi
         success "MySQL user '$DB_USER' created and granted privileges successfully."
     fi
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to install Firefly III
@@ -867,9 +916,9 @@ install_firefly() {
     # Update package lists again
     apt update
 
-    # Detect the latest available PHP version
+    # Detect the latest available stable PHP version
     LATEST_PHP_VERSION=$(get_latest_php_version)
-    info "Latest available PHP version is: $LATEST_PHP_VERSION"
+    info "Latest available stable PHP version is: $LATEST_PHP_VERSION"
 
     # Check if PHP is already installed
     if command -v php &>/dev/null; then
@@ -877,26 +926,39 @@ install_firefly() {
         CURRENT_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
         info "PHP is currently installed with version: $CURRENT_PHP_VERSION"
 
-        # Prompt the user to upgrade
-        if [ "$NON_INTERACTIVE" = true ]; then
-            UPGRADE_PHP="N" # Default to not upgrading PHP in non-interactive mode
+        # Determine if an upgrade is needed based on version comparison
+        if [ "$(printf '%s\n' "$LATEST_PHP_VERSION" "$CURRENT_PHP_VERSION" | sort -V | head -n1)" != "$LATEST_PHP_VERSION" ]; then
+            UPGRADE_NEEDED=true
         else
-            prompt "Do you want to upgrade PHP to the latest available version ($LATEST_PHP_VERSION)? (N/y): "
-            read UPGRADE_PHP
-            UPGRADE_PHP=${UPGRADE_PHP:-N}
+            UPGRADE_NEEDED=false
         fi
 
-        if [[ "$UPGRADE_PHP" =~ ^[Yy]$ ]]; then
+        if [ "$NON_INTERACTIVE" = true ]; then
+            UPGRADE_PHP=${UPGRADE_NEEDED}
+        else
+            if [ "$UPGRADE_NEEDED" = true ]; then
+                prompt "A newer stable PHP version ($LATEST_PHP_VERSION) is available. Do you want to upgrade? (Y/n): "
+                read UPGRADE_PHP_INPUT
+                UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-Y}
+                UPGRADE_PHP=$([[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]] && echo true || echo false)
+            else
+                UPGRADE_PHP=false
+                info "PHP is up to date."
+            fi
+        fi
+
+        if [ "$UPGRADE_PHP" = true ]; then
             info "Upgrading to PHP $LATEST_PHP_VERSION..."
+            # Proceed with upgrade logic
         else
             info "Skipping PHP upgrade. Using installed version: $CURRENT_PHP_VERSION"
             LATEST_PHP_VERSION=$CURRENT_PHP_VERSION
         fi
     else
-        # PHP is not installed, prompt to install the latest version
-        info "PHP is not currently installed."
+        # PHP is not installed, proceed to install the latest stable version
+        info "PHP is not currently installed. Installing PHP $LATEST_PHP_VERSION..."
         if [ "$NON_INTERACTIVE" = true ]; then
-            INSTALL_PHP="Y"
+            INSTALL_PHP="Y" # Automatically install the latest PHP in non-interactive mode
         else
             prompt "PHP $LATEST_PHP_VERSION is the latest available. Do you want to install this version? (Y/n): "
             read INSTALL_PHP
@@ -904,30 +966,43 @@ install_firefly() {
         fi
 
         if [[ "$INSTALL_PHP" =~ ^[Nn]$ ]]; then
-            if [ "$NON_INTERACTIVE" = true ]; then
-                PHP_VERSION="$LATEST_PHP_VERSION"
-            else
-                prompt "Enter the PHP version you want to install (available: $LATEST_PHP_VERSION): "
-                read PHP_VERSION
-                PHP_VERSION=${PHP_VERSION:-$LATEST_PHP_VERSION}
-            fi
+            prompt "Enter the PHP version you want to install (available: $LATEST_PHP_VERSION): "
+            read PHP_VERSION
+            PHP_VERSION=${PHP_VERSION:-$LATEST_PHP_VERSION}
             LATEST_PHP_VERSION=$PHP_VERSION
         fi
 
         info "Installing PHP $LATEST_PHP_VERSION..."
     fi
 
-    # Install the chosen PHP version and required extensions
-    apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+    # Remove any installed RC versions of PHP dynamically
+    info "Checking for any installed RC versions of PHP..."
+    RC_PHP_PACKAGES=$(dpkg -l | awk '/^ii/{print $2}' | grep -E '^php[0-9\.]+(-|$)' | while read -r pkg; do
+        # Get the package version
+        pkg_version=$(dpkg -s "$pkg" | awk '/Version:/{print $2}')
+        # Check if the version contains 'RC', 'alpha', or 'beta'
+        if [[ "$pkg_version" =~ (alpha|beta|RC) ]]; then
+            echo "$pkg"
+        fi
+    done)
 
-    # Get the latest installed PHP version
-    LATEST_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
-    info "Detected latest PHP version: $LATEST_PHP_VERSION"
+    if [ -n "$RC_PHP_PACKAGES" ]; then
+        info "Found installed PHP RC versions: $RC_PHP_PACKAGES"
+        apt purge -y $RC_PHP_PACKAGES
+        info "Purged PHP RC versions."
+    else
+        info "No PHP RC versions installed."
+    fi
+
+    # Install the latest stable PHP version and required extensions
+    apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+        php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+        php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+        php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
 
     # Handle retaining or disabling older PHP versions
     if [ "$NON_INTERACTIVE" = true ]; then
         RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
-        info "Not retaining older PHP versions in non-interactive mode."
     else
         prompt "Do you want to retain older PHP versions? (y/N): "
         read RETAIN_OLD_PHP
@@ -940,7 +1015,7 @@ install_firefly() {
         warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
 
         # Proceed with disabling old PHP versions
-        for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\\K[\\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
+        for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
             # Backup the current PHP configuration before disabling it
             PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
             if [ -f "$PHP_CONF" ]; then
@@ -964,7 +1039,7 @@ install_firefly() {
     # Install Certbot for Let's Encrypt SSL (or use a self-signed certificate if needed)
     apt install -y certbot python3-certbot-apache || {
         error "Failed to install Certbot. Please install manually and re-run the script."
-        exit 1
+        return 1
     }
 
     # Prompt for domain name and email address
@@ -1004,7 +1079,7 @@ install_firefly() {
         info "Obtaining SSL certificate using Let's Encrypt..."
         if ! certbot --apache --non-interactive --agree-tos --email "$EMAIL_ADDRESS" -d "$DOMAIN_NAME"; then
             error "Failed to obtain SSL certificate. Please check domain DNS settings, firewall rules, or network connectivity and try again."
-            exit 1
+            return 1
         fi
         success "SSL certificate successfully obtained for $DOMAIN_NAME."
     else
@@ -1024,7 +1099,7 @@ install_firefly() {
     if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]; then
         echo >&2 'ERROR: Invalid installer signature'
         rm composer-setup.php
-        exit 1
+        return 1
     fi
 
     php composer-setup.php --install-dir=/usr/local/bin --filename=composer
@@ -1034,31 +1109,31 @@ install_firefly() {
     info "Restarting Apache web server to apply PHP configuration..."
     apachectl configtest || {
         error "Apache configuration test failed. Please check the configuration."
-        exit 1
+        return 1
     }
 
     if ! systemctl restart apache2; then
         error "Failed to restart Apache. Please check the Apache error logs for more details."
-        exit 1
+        return 1
     fi
 
     # Download and validate Firefly III
-    download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || exit 1
+    download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || return 1
 
     # Extract the archive file
     archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
-    extract_archive "$archive_file" "$FIREFLY_INSTALL_DIR" || exit 1
+    extract_archive "$archive_file" "$FIREFLY_INSTALL_DIR" || return 1
 
     # Check if composer is installed before running it
     if ! command -v composer &>/dev/null; then
         error "Composer is not installed. Please install Composer and try again."
-        exit 1
+        return 1
     fi
 
     # Check if composer is installed before running it
     if ! command -v composer &>/dev/null; then
         error "Composer is not installed. Please install Composer and try again."
-        exit 1
+        return 1
     fi
 
     # Run composer install if vendor directory is missing
@@ -1074,7 +1149,7 @@ install_firefly() {
 
     # Copy .env.example to .env and configure
     info "Configuring Firefly III..."
-    setup_env_file
+    setup_env_file "$FIREFLY_INSTALL_DIR"
 
     # Set permissions before running artisan commands
     info "Setting ownership and permissions for Firefly III..."
@@ -1084,45 +1159,77 @@ install_firefly() {
     # Run artisan commands with error handling
     info "Running artisan commands for Firefly III..."
     cd "$FIREFLY_INSTALL_DIR"
-    if ! sudo -u www-data php artisan key:generate; then
-        error "Failed to generate application key with php artisan. Please check your configuration."
-        exit 1
+
+    # Generate application key if not already set
+    if grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" && [ -n "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
+        info "APP_KEY already set. Skipping key generation."
+    else
+        if ! sudo -u www-data php artisan key:generate; then
+            error "Failed to generate application key with php artisan. Please check your configuration."
+            return 1
+        fi
     fi
 
     # Capture the APP_KEY
     APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
     export APP_KEY
 
+    # Check if migrations have already been run
+    info "Checking if database migrations have already been applied..."
+    if sudo -u www-data php artisan migrate:status &>/dev/null; then
+        info "Migrations have already been applied. Skipping migration step."
+    else
+        info "No migrations found. Proceeding with database migration."
+        if ! sudo -u www-data php artisan migrate --force; then
+            error "Failed to migrate database with php artisan. Please check your configuration."
+            return 1
+        fi
+    fi
+
     # Update database schema and correct any issues with error handling
     info "Updating database schema and correcting any issues..."
     if ! sudo -u www-data php artisan config:cache; then
         error "Failed to cache configuration with php artisan. Please check your configuration."
-        exit 1
-    fi
-
-    if ! sudo -u www-data php artisan migrate --force; then
-        error "Failed to migrate database with php artisan. Please check your configuration."
-        exit 1
+        return 1
     fi
 
     if ! sudo -u www-data php artisan firefly-iii:upgrade-database; then
         error "Failed to upgrade Firefly III database. Please check your configuration."
-        exit 1
+        return 1
     fi
 
     if ! sudo -u www-data php artisan firefly-iii:correct-database; then
         error "Failed to correct database issues with Firefly III. Please check your configuration."
-        exit 1
+        return 1
     fi
 
     if ! sudo -u www-data php artisan firefly-iii:report-integrity; then
         error "Failed to report database integrity issues with Firefly III. Please check your configuration."
-        exit 1
+        return 1
     fi
 
-    if ! sudo -u www-data php artisan passport:install --force; then
-        error "Failed to install Laravel Passport. Please check your configuration."
-        exit 1
+    # Install Laravel Passport if not already installed
+    info "Checking if Laravel Passport tables already exist..."
+    PASSPORT_TABLE_EXISTS=$(mysql -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -e "SHOW TABLES LIKE 'oauth_auth_codes';" | grep -c "oauth_auth_codes")
+
+    if [ "$PASSPORT_TABLE_EXISTS" -eq 0 ]; then
+        info "Passport tables do not exist. Installing Laravel Passport..."
+        if ! sudo -u www-data php artisan passport:install --force --no-interaction; then
+            error "Failed to install Laravel Passport. Please check your configuration."
+            return 1
+        fi
+    else
+        info "Passport tables already exist. Skipping Laravel Passport installation."
+    fi
+
+    # Remove Passport migration files if tables already exist
+    if [ "$PASSPORT_TABLE_EXISTS" -ne 0 ]; then
+        info "Passport tables exist. Removing Passport migration files to prevent migration conflicts."
+        rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000001_create_oauth_auth_codes_table.php"
+        rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000002_create_oauth_access_tokens_table.php"
+        rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000003_create_oauth_refresh_tokens_table.php"
+        rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000004_create_oauth_clients_table.php"
+        rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000005_create_oauth_personal_access_clients_table.php"
     fi
 
     # Configure Apache for Firefly III
@@ -1133,12 +1240,6 @@ install_firefly() {
     fi
 
     if [ "$HAS_DOMAIN" = true ]; then
-        # Check if SSL certificates exist before configuring Apache
-        if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
-            error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-            exit 1
-        fi
-
         # Configuration when a domain name is provided
         cat >/etc/apache2/sites-available/firefly-iii.conf <<EOF
 <VirtualHost *:80>
@@ -1167,17 +1268,15 @@ EOF
 
         # Enable the SSL module and the new site configuration
         a2enmod ssl
+        a2enmod rewrite
         a2ensite firefly-iii
 
-        # Update the APP_URL in .env to use HTTPS and the domain name
-        # Set APP_URL based on whether a domain is configured or not
-        if [ "$HAS_DOMAIN" = true ]; then
-            sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN_NAME/firefly-iii|" "$FIREFLY_INSTALL_DIR/.env"
-            info "APP_URL set to https://$DOMAIN_NAME/firefly-iii in .env."
-        else
-            sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}/firefly-iii|" "$FIREFLY_INSTALL_DIR/.env"
-            info "APP_URL set to http://${server_ip}/firefly-iii in .env."
-        fi
+        # Disable the default site
+        a2dissite 000-default.conf || true
+
+        # Update the APP_URL in .env to use HTTPS and the domain name without '/firefly-iii'
+        sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN_NAME|" "$FIREFLY_INSTALL_DIR/.env"
+        info "APP_URL set to https://$DOMAIN_NAME in .env."
     else
         # Configuration when no domain name is provided
         cat >/etc/apache2/sites-available/firefly-iii.conf <<EOF
@@ -1198,47 +1297,65 @@ EOF
 
         # Disable SSL module and ensure the site is enabled
         a2dismod ssl || true
+        a2enmod rewrite
         a2ensite firefly-iii
 
-        # Update the APP_URL in .env to use HTTP and the server IP address
-        sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}/firefly-iii|" "$FIREFLY_INSTALL_DIR/.env"
+        # Disable the default site
+        a2dissite 000-default.conf || true
+
+        # Update the APP_URL in .env to use HTTP and the server IP address without '/firefly-iii'
+        sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}|" "$FIREFLY_INSTALL_DIR/.env"
+        info "APP_URL set to http://${server_ip} in .env."
     fi
 
     # Restart Apache to apply changes and add proper error handling
     info "Restarting Apache web server..."
     apachectl configtest || {
         error "Apache configuration test failed. Please check the configuration."
-        exit 1
+        return 1
     }
 
-    # Attempt to reload Apache, and if that fails, try starting it
     if ! systemctl restart apache2; then
         error "Failed to restart Apache. Please check the Apache error logs for more details."
-        exit 1
+        return 1
     fi
 
     success "Apache successfully reloaded or started."
 
-    # Save credentials to a file
-    save_credentials
-
-    success "Firefly III installation completed."
+    # Indicate successful completion
+    return 0
 }
 
 # Function to validate or create .env file for Firefly Importer
+# Accepts the directory (either $IMPORTER_INSTALL_DIR or $IMPORTER_TEMP_DIR) as an argument
 setup_importer_env_file() {
-    if [ ! -f "$IMPORTER_INSTALL_DIR/.env" ]; then
-        info "No .env file found, using .env.example as a template."
-        cp "$IMPORTER_INSTALL_DIR/.env.example" "$IMPORTER_INSTALL_DIR/.env"
+    local target_dir="$1"
+
+    if [ ! -f "$target_dir/.env" ]; then
+        info "No .env file found in $target_dir, using .env.example as a template."
+        cp "$target_dir/.env.example" "$target_dir/.env"
         info "Created new .env file from .env.example."
     else
-        info ".env file already exists. Validating required environment variables..."
+        info ".env file already exists in $target_dir."
     fi
 
-    # Validate essential environment variables in .env file
-    validate_env_var "FIREFLY_III_URL" "http://${server_ip}/firefly-iii"
+    # Set FIREFLY_III_URL to the root URL of Firefly III
+    if [ "$HAS_DOMAIN" = true ]; then
+        validate_env_var "FIREFLY_III_URL" "https://$DOMAIN_NAME"
+        info "FIREFLY_III_URL set to https://$DOMAIN_NAME in .env."
+    else
+        validate_env_var "FIREFLY_III_URL" "http://${server_ip}"
+        info "FIREFLY_III_URL set to http://${server_ip} in .env."
+    fi
+
+    # Set ownership and permissions for the .env file
+    chown www-data:www-data "$target_dir/.env"
+    chmod 640 "$target_dir/.env"
 
     success ".env file validated and updated for Firefly Importer."
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to install Firefly Importer
@@ -1246,70 +1363,55 @@ install_firefly_importer() {
     info "Installing Firefly Importer..."
 
     # Download and validate Firefly Importer
-    download_and_validate_release "firefly-iii/data-importer" "$IMPORTER_TEMP_DIR" "\\.zip$" || exit 1
+    download_and_validate_release "firefly-iii/data-importer" "$IMPORTER_TEMP_DIR" "\\.zip$" || return 1
 
     # Extract the archive file
     archive_file=$(ls "$IMPORTER_TEMP_DIR"/*.zip | head -n 1)
-    extract_archive "$archive_file" "$IMPORTER_TEMP_DIR" || exit 1
+    extract_archive "$archive_file" "$IMPORTER_TEMP_DIR" || return 1
 
-    # Move the new installation to the install directory
+    # Move the extracted files to the installation directory
     info "Installing Firefly Importer to $IMPORTER_INSTALL_DIR..."
-    mv "$IMPORTER_TEMP_DIR" "$IMPORTER_INSTALL_DIR"
+    mv "$IMPORTER_TEMP_DIR"/* "$IMPORTER_INSTALL_DIR/"
 
-    # Set ownership and permissions for the new installation
+    # Set ownership and permissions **before** running composer
+    info "Setting ownership and permissions for Firefly Importer..."
     chown -R www-data:www-data "$IMPORTER_INSTALL_DIR"
-    chmod -R 775 "$IMPORTER_INSTALL_DIR/storage"
+    find "$IMPORTER_INSTALL_DIR" -type f -exec chmod 644 {} \;
+    find "$IMPORTER_INSTALL_DIR" -type d -exec chmod 755 {} \;
+    chmod -R 775 "$IMPORTER_INSTALL_DIR/storage" "$IMPORTER_INSTALL_DIR/bootstrap/cache"
 
-    # Call the function to validate or create the .env file for Firefly Importer
-    setup_importer_env_file
-
-    # Set ownership and permissions for the .env file
-    chown www-data:www-data "$IMPORTER_INSTALL_DIR/.env"
-    chmod 640 "$IMPORTER_INSTALL_DIR/.env"
-
-    # Update .env file to set FIREFLY_III_URL
-    info "Configuring Firefly Importer .env file..."
-    sed -i "s|FIREFLY_III_URL=.*|FIREFLY_III_URL=http://${server_ip}/firefly-iii|" "$IMPORTER_INSTALL_DIR/.env" || {
-        error "Failed to update the .env file."
-        exit 1
+    # Run composer install in the Firefly Importer directory
+    info "Installing Composer dependencies for Firefly Importer..."
+    if ! command -v composer &>/dev/null; then
+        error "Composer is not installed. Please install Composer and try again."
+        return 1
+    fi
+    cd "$IMPORTER_INSTALL_DIR"
+    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader || {
+        error "Composer install failed for Firefly Importer. Please check the error messages above."
+        return 1
     }
 
-    # Set permissions
-    info "Setting permissions..."
-    chown -R www-data:www-data "$IMPORTER_INSTALL_DIR"
-    chmod -R 775 "$IMPORTER_INSTALL_DIR/storage"
+    # Generate application key
+    info "Generating application key for Firefly Importer..."
+    sudo -u www-data php artisan key:generate --no-interaction || {
+        error "Failed to generate application key for Firefly Importer."
+        return 1
+    }
 
-    # Call the function to validate or create the .env file for Firefly Importer
-    setup_importer_env_file
+    # Setup the .env file
+    setup_importer_env_file "$IMPORTER_INSTALL_DIR"
 
-    # Adjust Apache configuration to serve Firefly Importer with HTTPS
-    info "Configuring Apache for Firefly Importer with HTTPS..."
+    # Configure Apache to serve Firefly Importer under '/data-importer'
+    info "Configuring Apache for Firefly Importer under '/data-importer'..."
 
-    # Check if SSL certificates exist before configuring Apache
-    if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
-        error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-        exit 1
-    fi
-
-    # Backup existing Apache configuration if present
-    if [ -f /etc/apache2/sites-available/firefly-importer.conf ]; then
-        cp /etc/apache2/sites-available/firefly-importer.conf /etc/apache2/sites-available/firefly-importer.conf.bak
-    fi
-
-    # Create new Apache configuration
+    # Create Apache configuration with Alias for importer
     cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
 <VirtualHost *:80>
-    ServerName $DOMAIN_NAME
-    Redirect permanent / https://$DOMAIN_NAME/data-importer
-</VirtualHost>
+    ServerAdmin webmaster@localhost
+    DocumentRoot $FIREFLY_INSTALL_DIR/public
 
-<VirtualHost *:443>
-    ServerName $DOMAIN_NAME
-    DocumentRoot $IMPORTER_INSTALL_DIR/public
-
-    SSLEngine on
-    SSLCertificateFile /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem
+    Alias /data-importer $IMPORTER_INSTALL_DIR/public
 
     <Directory $IMPORTER_INSTALL_DIR/public>
         Options -Indexes +FollowSymLinks
@@ -1322,29 +1424,27 @@ install_firefly_importer() {
 </VirtualHost>
 EOF
 
-    # Enable the SSL module and the new site configuration
-    a2enmod ssl
+    # Enable the site and required modules
+    a2enmod rewrite
     a2ensite firefly-importer
 
-    # Restart Apache to apply changes and add proper error handling
+    # Restart Apache to apply changes
     info "Restarting Apache web server..."
     apachectl configtest || {
         error "Apache configuration test failed. Please check the configuration."
-        exit 1
+        return 1
     }
 
-    # Attempt to reload Apache, and if that fails, try starting it
     if ! systemctl restart apache2; then
+        {
         error "Failed to restart Apache. Please check the Apache error logs for more details."
-        exit 1
-    fi
-
-    success "Apache successfully reloaded or started."
-
-    # Verify if Certbot's systemd timer or cron job for renewal exists
-    check_certbot_auto_renewal
+        return 1
+    }
 
     success "Firefly Importer installation completed."
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to update Firefly Importer
@@ -1367,17 +1467,41 @@ update_firefly_importer() {
         create_backup "$IMPORTER_INSTALL_DIR"
 
         # Download and validate Firefly Importer
-        download_and_validate_release "firefly-iii/data-importer" "$IMPORTER_TEMP_DIR" "\\.zip$" || exit 1
+        download_and_validate_release "firefly-iii/data-importer" "$IMPORTER_TEMP_DIR" "\\.zip$" || return 1
 
         # Extract the archive file
         archive_file=$(ls "$IMPORTER_TEMP_DIR"/*.zip | head -n 1)
-        extract_archive "$archive_file" "$IMPORTER_TEMP_DIR" || exit 1
+        extract_archive "$archive_file" "$IMPORTER_TEMP_DIR" || return 1
 
         # Copy over the .env file
         info "Copying configuration files..."
         if [ -f "$IMPORTER_INSTALL_DIR/.env" ]; then
             cp "$IMPORTER_INSTALL_DIR/.env" "$IMPORTER_TEMP_DIR/.env"
+            chown www-data:www-data "$IMPORTER_TEMP_DIR/.env"
+            chmod 640 "$IMPORTER_TEMP_DIR/.env"
+        else
+            warning "No .env file found in $IMPORTER_INSTALL_DIR. Creating a new .env file from .env.example..."
+
+            # Search for .env.example using find to ensure it exists
+            env_example_path=$(find "$IMPORTER_TEMP_DIR" -name ".env.example" -print -quit)
+
+            if [ -n "$env_example_path" ]; then
+                cp "$env_example_path" "$IMPORTER_TEMP_DIR/.env"
+                chown www-data:www-data "$IMPORTER_TEMP_DIR/.env"
+                chmod 640 "$IMPORTER_TEMP_DIR/.env"
+                info "Created new .env file from .env.example."
+
+                # Call the Firefly Importer-specific setup function to validate .env
+                setup_importer_env_file "$IMPORTER_TEMP_DIR"
+            else
+                error ".env.example not found in $IMPORTER_TEMP_DIR. Please ensure the example file is present for creating a new .env file."
+                return 1
+            fi
         fi
+
+        # Set ownership and permissions for the .env file
+        chown www-data:www-data "$IMPORTER_TEMP_DIR/.env"
+        chmod 640 "$IMPORTER_TEMP_DIR/.env"
 
         # Set ownership and permissions for the .env file
         chown www-data:www-data "$IMPORTER_TEMP_DIR/.env"
@@ -1401,7 +1525,7 @@ update_firefly_importer() {
         # Check if SSL certificates exist before configuring Apache
         if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
             error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-            exit 1
+            return 1
         fi
 
         # Backup existing Apache configuration if present
@@ -1443,13 +1567,13 @@ EOF
         info "Restarting Apache web server..."
         apachectl configtest || {
             error "Apache configuration test failed. Please check the configuration."
-            exit 1
+            return 1
         }
 
         # Attempt to reload Apache, and if that fails, try starting it
         if ! systemctl restart apache2; then
             error "Failed to restart Apache. Please check the Apache error logs for more details."
-            exit 1
+            return 1
         fi
 
         success "Apache successfully reloaded or started."
@@ -1481,6 +1605,9 @@ EOF
         info "Update canceled by the user."
         exit 0
     fi
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to setup cron job for scheduled tasks
@@ -1510,7 +1637,7 @@ setup_cron_job() {
             echo "0 $CRON_HOUR * * * www-data $CRON_CMD" >>/etc/cron.d/firefly-iii-cron
         else
             error "Invalid CRON_HOUR value: $CRON_HOUR. Must be a numeric value between 0-23."
-            exit 1
+            return 1
         fi
         info "Cron job for Firefly III added."
     else
@@ -1523,13 +1650,16 @@ setup_cron_job() {
     # Restart cron service to apply changes
     systemctl restart cron || {
         error "Failed to restart cron service."
-        exit 1
+        return 1
     }
 
     # Export CRON_HOUR to make it accessible globally
     export CRON_HOUR
 
     success "Cron job for Firefly III scheduled tasks has been set up."
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to check Certbot auto-renewal mechanism
@@ -1636,9 +1766,9 @@ update_firefly() {
         info "Updating package lists..."
         apt update
 
-        # Detect the latest available PHP version
+        # Detect the latest available stable PHP version
         LATEST_PHP_VERSION=$(get_latest_php_version)
-        info "Latest available PHP version is: $LATEST_PHP_VERSION"
+        info "Latest available stable PHP version is: $LATEST_PHP_VERSION"
 
         # Check if PHP is already installed
         if command -v php &>/dev/null; then
@@ -1646,26 +1776,39 @@ update_firefly() {
             CURRENT_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
             info "PHP is currently installed with version: $CURRENT_PHP_VERSION"
 
-            # Prompt the user to upgrade
-            if [ "$NON_INTERACTIVE" = true ]; then
-                UPGRADE_PHP="N" # Default to not upgrading PHP in non-interactive mode
+            # Determine if an upgrade is needed based on version comparison
+            if [ "$(printf '%s\n' "$LATEST_PHP_VERSION" "$CURRENT_PHP_VERSION" | sort -V | head -n1)" != "$LATEST_PHP_VERSION" ]; then
+                UPGRADE_NEEDED=true
             else
-                prompt "Do you want to upgrade PHP to the latest available version ($LATEST_PHP_VERSION)? (N/y): "
-                read UPGRADE_PHP
-                UPGRADE_PHP=${UPGRADE_PHP:-N}
+                UPGRADE_NEEDED=false
             fi
 
-            if [[ "$UPGRADE_PHP" =~ ^[Yy]$ ]]; then
+            if [ "$NON_INTERACTIVE" = true ]; then
+                UPGRADE_PHP=${UPGRADE_NEEDED}
+            else
+                if [ "$UPGRADE_NEEDED" = true ]; then
+                    prompt "A newer stable PHP version ($LATEST_PHP_VERSION) is available. Do you want to upgrade? (Y/n): "
+                    read UPGRADE_PHP_INPUT
+                    UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-Y}
+                    UPGRADE_PHP=$([[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]] && echo true || echo false)
+                else
+                    UPGRADE_PHP=false
+                    info "PHP is up to date."
+                fi
+            fi
+
+            if [ "$UPGRADE_PHP" = true ]; then
                 info "Upgrading to PHP $LATEST_PHP_VERSION..."
+                # Proceed with upgrade logic
             else
                 info "Skipping PHP upgrade. Using installed version: $CURRENT_PHP_VERSION"
                 LATEST_PHP_VERSION=$CURRENT_PHP_VERSION
             fi
         else
-            # PHP is not installed, prompt to install the latest version
-            info "PHP is not currently installed."
+            # PHP is not installed, proceed to install the latest stable version
+            info "PHP is not currently installed. Installing PHP $LATEST_PHP_VERSION..."
             if [ "$NON_INTERACTIVE" = true ]; then
-                INSTALL_PHP="Y"
+                INSTALL_PHP="Y" # Automatically install the latest PHP in non-interactive mode
             else
                 prompt "PHP $LATEST_PHP_VERSION is the latest available. Do you want to install this version? (Y/n): "
                 read INSTALL_PHP
@@ -1673,21 +1816,41 @@ update_firefly() {
             fi
 
             if [[ "$INSTALL_PHP" =~ ^[Nn]$ ]]; then
-                if [ "$NON_INTERACTIVE" = true ]; then
-                    PHP_VERSION="$LATEST_PHP_VERSION"
-                else
-                    prompt "Enter the PHP version you want to install (available: $LATEST_PHP_VERSION): "
-                    read PHP_VERSION
-                    PHP_VERSION=${PHP_VERSION:-$LATEST_PHP_VERSION}
-                fi
+                prompt "Enter the PHP version you want to install (available: $LATEST_PHP_VERSION): "
+                read PHP_VERSION
+                PHP_VERSION=${PHP_VERSION:-$LATEST_PHP_VERSION}
                 LATEST_PHP_VERSION=$PHP_VERSION
             fi
 
             info "Installing PHP $LATEST_PHP_VERSION..."
         fi
 
-        # Install the chosen PHP version and required extensions
-        apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+        # **Insert the Dynamic Removal of RC Versions code here**
+
+        # Remove any installed RC versions of PHP dynamically
+        info "Checking for any installed RC versions of PHP..."
+        RC_PHP_PACKAGES=$(dpkg -l | awk '/^ii/{print $2}' | grep -E '^php[0-9\.]+(-|$)' | while read -r pkg; do
+            # Get the package version
+            pkg_version=$(dpkg -s "$pkg" | awk '/Version:/{print $2}')
+            # Check if the version contains 'RC', 'alpha', or 'beta'
+            if [[ "$pkg_version" =~ (alpha|beta|RC) ]]; then
+                echo "$pkg"
+            fi
+        done)
+
+        if [ -n "$RC_PHP_PACKAGES" ]; then
+            info "Found installed PHP RC versions: $RC_PHP_PACKAGES"
+            apt purge -y $RC_PHP_PACKAGES
+            info "Purged PHP RC versions."
+        else
+            info "No PHP RC versions installed."
+        fi
+
+        # Install the latest PHP version and required extensions
+        apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+            php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+            php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+            php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
 
         # Get the latest installed PHP version
         LATEST_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
@@ -1695,7 +1858,7 @@ update_firefly() {
 
         # Handle retaining or disabling older PHP versions
         if [ "$NON_INTERACTIVE" = true ]; then
-            RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-false} # Default to not retaining old PHP versions in non-interactive mode
+            RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
         else
             prompt "Do you want to retain older PHP versions? (y/N): "
             read RETAIN_OLD_PHP
@@ -1708,7 +1871,7 @@ update_firefly() {
             warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
 
             # Proceed with disabling old PHP versions
-            for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\\K[\\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
+            for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
                 # Backup the current PHP configuration before disabling it
                 PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
                 if [ -f "$PHP_CONF" ]; then
@@ -1729,23 +1892,37 @@ update_firefly() {
         create_backup "$FIREFLY_INSTALL_DIR"
 
         # Download and validate the latest release
-        download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || exit 1
+        download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || return 1
 
         # Extract the archive file
         archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
-        extract_archive "$archive_file" "$FIREFLY_TEMP_DIR" || exit 1
+        extract_archive "$archive_file" "$FIREFLY_TEMP_DIR" || return 1
+
+        # Search for the .env.example file
+        env_example_path=$(find "$FIREFLY_TEMP_DIR" -name ".env.example" -print -quit)
 
         # Copy over the .env file
         info "Copying configuration files..."
         if [ -f "$FIREFLY_INSTALL_DIR/.env" ]; then
             cp "$FIREFLY_INSTALL_DIR/.env" "$FIREFLY_TEMP_DIR/.env"
+            chown www-data:www-data "$FIREFLY_TEMP_DIR/.env"
+            chmod 640 "$FIREFLY_TEMP_DIR/.env"
+        else
+            warning "No .env file found in $FIREFLY_INSTALL_DIR. Creating a new .env file from .env.example..."
+
+            # Check if the .env.example file was found
+            if [ -n "$env_example_path" ]; then
+                cp "$env_example_path" "$FIREFLY_TEMP_DIR/.env"
+                chown www-data:www-data "$FIREFLY_TEMP_DIR/.env"
+                chmod 640 "$FIREFLY_TEMP_DIR/.env"
+                setup_env_file "$FIREFLY_TEMP_DIR" # Populate the new .env file with necessary configurations
+            else
+                error ".env.example not found. Please ensure the example file is present."
+                return 1
+            fi
         fi
 
-        # Set ownership and permissions for the .env file
-        chown www-data:www-data "$FIREFLY_TEMP_DIR/.env"
-        chmod 640 "$FIREFLY_TEMP_DIR/.env"
-
-        # Set permissions
+        # Set permissions for the rest of the files in the temp directory
         info "Setting permissions..."
         chown -R www-data:www-data "$FIREFLY_TEMP_DIR"
         chmod -R 775 "$FIREFLY_TEMP_DIR/storage"
@@ -1764,45 +1941,81 @@ update_firefly() {
         # Run artisan commands with error handling
         info "Running artisan commands for Firefly III..."
         cd "$FIREFLY_INSTALL_DIR"
-        if ! sudo -u www-data php artisan key:generate; then
-            error "Failed to generate application key with php artisan. Please check your configuration."
-            exit 1
+
+        # Generate application key if not already set
+        if grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" && [ -n "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
+            info "APP_KEY already set. Skipping key generation."
+        else
+            if ! sudo -u www-data php artisan key:generate; then
+                error "Failed to generate application key with php artisan. Please check your configuration."
+                return 1
+            fi
         fi
 
         # Capture the APP_KEY
         APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
         export APP_KEY
 
+        # Check if migrations have already been run
+        info "Checking if database migrations have already been applied..."
+        if sudo -u www-data php artisan migrate:status &>/dev/null; then
+            info "Migrations have already been applied. Proceeding to migrate any new changes."
+            if ! sudo -u www-data php artisan migrate --force; then
+                error "Failed to migrate database with php artisan. Please check your configuration."
+                return 1
+            fi
+        else
+            info "No migrations found. Proceeding with database migration."
+            if ! sudo -u www-data php artisan migrate --force; then
+                error "Failed to migrate database with php artisan. Please check your configuration."
+                return 1
+            fi
+        fi
+
         # Update database schema and correct any issues with error handling
         info "Updating database schema and correcting any issues..."
         if ! sudo -u www-data php artisan config:cache; then
             error "Failed to cache configuration with php artisan. Please check your configuration."
-            exit 1
-        fi
-
-        if ! sudo -u www-data php artisan migrate --force; then
-            error "Failed to migrate database with php artisan. Please check your configuration."
-            exit 1
+            return 1
         fi
 
         if ! sudo -u www-data php artisan firefly-iii:upgrade-database; then
             error "Failed to upgrade Firefly III database. Please check your configuration."
-            exit 1
+            return 1
         fi
 
         if ! sudo -u www-data php artisan firefly-iii:correct-database; then
             error "Failed to correct database issues with Firefly III. Please check your configuration."
-            exit 1
+            return 1
         fi
 
         if ! sudo -u www-data php artisan firefly-iii:report-integrity; then
             error "Failed to report database integrity issues with Firefly III. Please check your configuration."
-            exit 1
+            return 1
         fi
 
-        if ! sudo -u www-data php artisan passport:install --force; then
-            error "Failed to install Laravel Passport. Please check your configuration."
-            exit 1
+        # Check if Passport tables already exist
+        info "Checking if Laravel Passport tables already exist..."
+        PASSPORT_TABLE_EXISTS=$(mysql -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -e "SHOW TABLES LIKE 'oauth_auth_codes';" | grep -c "oauth_auth_codes")
+
+        if [ "$PASSPORT_TABLE_EXISTS" -eq 0 ]; then
+            info "Passport tables do not exist. Installing Laravel Passport..."
+            if ! sudo -u www-data php artisan passport:install --force --no-interaction; then
+                error "Failed to install Laravel Passport. Please check your configuration."
+                return 1
+            fi
+        else
+            info "Passport tables already exist. Skipping Laravel Passport installation."
+        fi
+
+        # Remove Passport migration files if tables already exist
+        if [ "$PASSPORT_TABLE_EXISTS" -ne 0 ]; then
+            info "Passport tables exist. Removing Passport migration files to prevent migration conflicts."
+            rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000001_create_oauth_auth_codes_table.php"
+            rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000002_create_oauth_access_tokens_table.php"
+            rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000003_create_oauth_refresh_tokens_table.php"
+            rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000004_create_oauth_clients_table.php"
+            rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000005_create_oauth_personal_access_clients_table.php"
         fi
 
         # Adjust Apache configuration to serve Firefly III with HTTPS
@@ -1811,7 +2024,7 @@ update_firefly() {
         # Check if SSL certificates exist before configuring Apache
         if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
             error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-            exit 1
+            return 1
         fi
 
         # Backup existing Apache configuration if present
@@ -1862,13 +2075,13 @@ EOF
         info "Restarting Apache web server..."
         apachectl configtest || {
             error "Apache configuration test failed. Please check the configuration."
-            exit 1
+            return 1
         }
 
         # Attempt to reload Apache, and if that fails, try starting it
         if ! systemctl restart apache2; then
             error "Failed to restart Apache. Please check the Apache error logs for more details."
-            exit 1
+            return 1
         fi
 
         success "Apache successfully reloaded or started."
@@ -1900,6 +2113,9 @@ EOF
         info "Update canceled by the user."
         exit 0
     fi
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to cleanup temporary files
@@ -1968,7 +2184,6 @@ server_ip=$(hostname -I | awk '{print $1}')
 trap 'cleanup; echo -e "${COLOR_YELLOW}Log file for this run: ${LOG_FILE}${COLOR_RESET}"; echo -e "${COLOR_YELLOW}For troubleshooting, check the log at: ${LOG_FILE}${COLOR_RESET}";' EXIT
 
 # Update package lists once
-add-apt-repository ppa:ondrej/php
 apt-get update
 apt-get full-upgrade -y
 for cmd in curl jq wget unzip openssl gpg; do # Add gpg here
@@ -1976,7 +2191,7 @@ for cmd in curl jq wget unzip openssl gpg; do # Add gpg here
         warning "Command '$cmd' is missing. Installing it now..."
         apt-get install -y $cmd || {
             error "Failed to install '$cmd'. Please install it manually and re-run the script."
-            exit 1
+            return 1
         }
     fi
 done
@@ -1986,14 +2201,14 @@ if ! command -v apachectl &>/dev/null; then
     info "Apache is not installed. Proceeding to install Apache..."
     apt-get install -y apache2 || {
         error "Failed to install Apache. Please check your network connection and package manager settings, and then try installing Apache manually with 'apt-get install apache2'."
-        exit 1
+        return 1
     }
 
     # Start Apache after installation
     info "Starting Apache service..."
     systemctl start apache2 || {
         error "Failed to start Apache. Please check the system logs for more details and manually start the service using 'systemctl start apache2'."
-        exit 1
+        return 1
     }
 
     success "Apache installed and started successfully."
@@ -2004,7 +2219,7 @@ else
         # Check for non-interactive mode
         if [ "$NON_INTERACTIVE" = true ]; then
             error "Apache configuration issues must be fixed manually in non-interactive mode. Exiting."
-            exit 1
+            return 1
         fi
 
         # Ask if the user wants to retry in interactive mode
@@ -2016,11 +2231,11 @@ else
             info "Retrying Apache configuration test..."
             apachectl configtest || {
                 error "Apache configuration test failed again. Please resolve the issue and re-run the script."
-                exit 1
+                return 1
             }
         else
             error "Apache configuration issues must be fixed before proceeding. Exiting."
-            exit 1
+            return 1
         fi
     }
 
@@ -2032,14 +2247,217 @@ for dir in "$FIREFLY_INSTALL_DIR" "$IMPORTER_INSTALL_DIR"; do
     if [ ! -d "$dir" ]; then
         mkdir -p "$dir" || {
             error "Failed to create directory '$dir'. Please check permissions and try again."
-            exit 1
+            return 1
         }
     fi
     if [ ! -w "$dir" ]; then
         error "The directory '$dir' is not writable. Please check permissions and try again."
-        exit 1
+        return 1
     fi
 done
+
+# Function to check if Firefly III is installed and functional
+check_firefly_installation() {
+    if [ -d "$FIREFLY_INSTALL_DIR" ]; then
+        info "Firefly III directory exists. Verifying installation..."
+
+        # Check if important directories exist
+        if [ ! -d "$FIREFLY_INSTALL_DIR/public" ] || [ ! -d "$FIREFLY_INSTALL_DIR/storage" ]; then
+            error "Important Firefly III directories are missing (public or storage). This may indicate a broken installation."
+            return 1
+        fi
+
+        # Check for critical files
+        if [ ! -f "$FIREFLY_INSTALL_DIR/.env" ] || [ ! -f "$FIREFLY_INSTALL_DIR/artisan" ] || [ ! -f "$FIREFLY_INSTALL_DIR/config/app.php" ]; then
+            error "Critical Firefly III files are missing (.env, artisan, config/app.php)."
+            return 1
+        fi
+
+        # Check if .env file contains necessary configurations
+        if ! grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env"; then
+            error "APP_KEY is missing from the .env file."
+            return 1
+        fi
+
+        if ! grep -q '^DB_CONNECTION=' "$FIREFLY_INSTALL_DIR/.env"; then
+            error "Database configuration is missing from the .env file."
+            return 1
+        fi
+
+        # Check if the vendor directory exists (Composer dependencies)
+        if [ ! -d "$FIREFLY_INSTALL_DIR/vendor" ]; then
+            error "Composer dependencies (vendor directory) are missing. You may need to run 'composer install'."
+            return 1
+        fi
+
+        # Read database credentials from .env file
+        if [ -f "$FIREFLY_INSTALL_DIR/.env" ]; then
+            DB_CONNECTION=$(grep '^DB_CONNECTION=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_HOST=$(grep '^DB_HOST=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PORT=$(grep '^DB_PORT=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_NAME=$(grep '^DB_DATABASE=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_USER=$(grep '^DB_USERNAME=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PASS=$(grep '^DB_PASSWORD=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+        else
+            error ".env file not found in $FIREFLY_INSTALL_DIR. Cannot read database credentials."
+            return 1
+        fi
+
+        # Verify database connectivity based on DB_CONNECTION in the .env file
+        if [ "$DB_CONNECTION" = "mysql" ]; then
+            info "Checking MySQL database connection..."
+
+            # Create a temporary MySQL configuration file
+            TEMP_MY_CNF=$(mktemp)
+            chmod 600 "$TEMP_MY_CNF"
+            cat >"$TEMP_MY_CNF" <<EOF
+[client]
+host=$DB_HOST
+port=$DB_PORT
+user=$DB_USER
+password=$DB_PASS
+EOF
+
+            # Attempt to connect using the temporary configuration file
+            if ! mysql --defaults-extra-file="$TEMP_MY_CNF" -D "$DB_NAME" -e 'SELECT 1;' &>/dev/null; then
+                rm -f "$TEMP_MY_CNF"
+                error "Failed to connect to MySQL database. Please check your database credentials."
+                return 1
+            fi
+            rm -f "$TEMP_MY_CNF"
+            success "Successfully connected to MySQL database."
+        elif [ "$DB_CONNECTION" = "sqlite" ]; then
+            info "Checking SQLite database file..."
+            if [ ! -f "$FIREFLY_INSTALL_DIR/database/database.sqlite" ]; then
+                error "SQLite database file is missing."
+                return 1
+            fi
+            success "SQLite database file exists."
+        else
+            error "Unknown database connection type specified in .env file."
+            return 1
+        fi
+
+        # Check if Apache or Nginx is running
+        if systemctl is-active --quiet apache2; then
+            success "Apache is running."
+        elif systemctl is-active --quiet nginx; then
+            success "Nginx is running."
+        else
+            warning "Neither Apache nor Nginx is running. The web server may not be properly configured."
+            return 1
+        fi
+
+        # If all checks passed
+        success "Firefly III is installed and seems functional."
+        return 0
+    else
+        # Directory does not exist, likely a fresh install
+        warning "Firefly III directory does not exist. Proceeding with a fresh installation..."
+        return 1
+    fi
+}
+
+# Function to check if Firefly Importer is installed and functional
+check_firefly_importer_installation() {
+    if [ -d "$IMPORTER_INSTALL_DIR" ]; then
+        info "Firefly Importer directory exists. Verifying installation..."
+
+        # Check if important directories exist
+        if [ ! -d "$IMPORTER_INSTALL_DIR/public" ] || [ ! -d "$IMPORTER_INSTALL_DIR/storage" ]; then
+            error "Important Firefly Importer directories are missing (public or storage). This may indicate a broken installation."
+            return 1
+        fi
+
+        # Check for critical files
+        if [ ! -f "$IMPORTER_INSTALL_DIR/.env" ] || [ ! -f "$IMPORTER_INSTALL_DIR/artisan" ] || [ ! -f "$IMPORTER_INSTALL_DIR/config/app.php" ]; then
+            error "Critical Firefly Importer files are missing (.env, artisan, config/app.php)."
+            return 1
+        fi
+
+        # Check if .env file contains necessary configurations
+        if ! grep -q '^APP_KEY=' "$IMPORTER_INSTALL_DIR/.env"; then
+            error "APP_KEY is missing from the .env file."
+            return 1
+        fi
+
+        if ! grep -q '^FIREFLY_III_URL=' "$IMPORTER_INSTALL_DIR/.env"; then
+            error "Firefly III URL configuration is missing from the .env file."
+            return 1
+        fi
+
+        # Check if the vendor directory exists (Composer dependencies)
+        if [ ! -d "$IMPORTER_INSTALL_DIR/vendor" ]; then
+            error "Composer dependencies (vendor directory) are missing. You may need to run 'composer install'."
+            return 1
+        fi
+
+        # Read database credentials from .env file (if applicable)
+        if [ -f "$IMPORTER_INSTALL_DIR/.env" ]; then
+            DB_CONNECTION=$(grep '^DB_CONNECTION=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_HOST=$(grep '^DB_HOST=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PORT=$(grep '^DB_PORT=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_NAME=$(grep '^DB_DATABASE=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_USER=$(grep '^DB_USERNAME=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PASS=$(grep '^DB_PASSWORD=' "$IMPORTER_INSTALL_DIR/.env" | cut -d '=' -f2-)
+        else
+            error ".env file not found in $IMPORTER_INSTALL_DIR. Cannot read configuration."
+            return 1
+        fi
+
+        # Verify database connectivity if applicable
+        if [ "$DB_CONNECTION" = "mysql" ]; then
+            info "Checking MySQL database connection for Importer..."
+
+            # Create a temporary MySQL configuration file
+            TEMP_MY_CNF=$(mktemp)
+            chmod 600 "$TEMP_MY_CNF"
+            cat >"$TEMP_MY_CNF" <<EOF
+[client]
+host=$DB_HOST
+port=$DB_PORT
+user=$DB_USER
+password=$DB_PASS
+EOF
+
+            # Attempt to connect using the temporary configuration file
+            if ! mysql --defaults-extra-file="$TEMP_MY_CNF" -D "$DB_NAME" -e 'SELECT 1;' &>/dev/null; then
+                rm -f "$TEMP_MY_CNF"
+                error "Failed to connect to MySQL database for Importer. Please check your database credentials."
+                return 1
+            fi
+            rm -f "$TEMP_MY_CNF"
+            success "Successfully connected to MySQL database for Importer."
+        elif [ "$DB_CONNECTION" = "sqlite" ]; then
+            info "Checking SQLite database file for Importer..."
+            if [ ! -f "$IMPORTER_INSTALL_DIR/database/database.sqlite" ]; then
+                error "SQLite database file is missing for Importer."
+                return 1
+            fi
+            success "SQLite database file for Importer exists."
+        else
+            warning "No database connection configured for Importer or unknown connection type."
+        fi
+
+        # Check if Apache or Nginx is running and serving Firefly Importer
+        if systemctl is-active --quiet apache2; then
+            success "Apache is running."
+        elif systemctl is-active --quiet nginx; then
+            success "Nginx is running."
+        else
+            warning "Neither Apache nor Nginx is running. The web server may not be properly configured for Importer."
+            return 1
+        fi
+
+        # If all checks passed
+        success "Firefly Importer is installed and seems functional."
+        return 0
+    else
+        # Directory does not exist, likely a fresh install
+        warning "Firefly Importer directory does not exist. Proceeding with a fresh installation..."
+        return 1
+    fi
+}
 
 #####################################################################################################################################################
 #
@@ -2047,22 +2465,38 @@ done
 #
 #####################################################################################################################################################
 
-# Check if Firefly III is installed
-if [ -d "$FIREFLY_INSTALL_DIR" ]; then
+# Main check for Firefly III installation or update
+if check_firefly_installation; then
     # Update Firefly III
-    update_firefly
+    if ! update_firefly; then
+        error "Firefly III update failed."
+        # Decide whether to exit or proceed
+        # For example, you might choose to exit:
+        exit 1
+        # Or you can choose to proceed to the next steps
+    fi
 else
     # Fresh installation of Firefly III
-    install_firefly
+    if ! install_firefly; then
+        error "Firefly III installation failed."
+        # Decide whether to exit or proceed
+        exit 1
+    fi
 fi
 
-# Check if Firefly Importer is installed
-if [ -d "$IMPORTER_INSTALL_DIR" ]; then
+# Main check for Firefly Importer installation or update
+if check_firefly_importer_installation; then
     # Update Firefly Importer
-    update_firefly_importer
+    if ! update_firefly_importer; then
+        error "Firefly Importer update failed."
+        exit 1
+    fi
 else
     # Fresh installation of Firefly Importer
-    install_firefly_importer
+    if ! install_firefly_importer; then
+        error "Firefly Importer installation failed."
+        exit 1
+    fi
 fi
 
 # Final message
