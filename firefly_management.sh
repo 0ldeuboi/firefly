@@ -19,16 +19,6 @@
 #
 #####################################################################################################################################################
 
-# Ensure the script is run as root
-if [ "$EUID" -ne 0 ]; then
-    error "Please run this script as root."
-    exit 1
-fi
-
-# Set exit on failure
-# set -e
-# set -o pipefail
-
 # Define colors and bold formatting for messages
 COLOR_RESET="\033[0m"
 COLOR_RED="\033[31m"
@@ -67,6 +57,16 @@ error() {
 prompt() {
     echo -ne "${COLOR_CYAN}$*${COLOR_RESET}"
 }
+
+# Ensure the script is run as root
+if [ "$EUID" -ne 0 ]; then
+    error "Please run this script as root."
+    exit 1
+fi
+
+# Default settings
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+HAS_DOMAIN="${HAS_DOMAIN:-false}"
 
 # ASCII Image (Splash screen)
 cat <<"EOF"
@@ -142,7 +142,7 @@ DB_PASS=""
 STATIC_CRON_TOKEN=""
 APP_KEY=""
 CRON_HOUR=""
-CREDENTIALS_FILE="/root/firefly_credentials.txt"
+CREDENTIALS_FILE="$HOME/firefly_credentials.txt"
 
 #####################################################################################################################################################
 #
@@ -629,7 +629,7 @@ download_and_validate_release() {
 
     # If no sha256 checksum is available, skip validation
     if [ -z "$sha256_url" ]; then
-        warning "No SHA256 checksum found for $repo. Skipping checksum validation."
+        warning "No SHA256 checksum found for $repo. Skipping checksum validation. Proceeding without checksum verification may pose security risks."
     else
         # Download the sha256 checksum file
         info "Downloading SHA256 checksum from $sha256_url..."
@@ -875,7 +875,10 @@ create_mysql_user() {
         info "MySQL user '$DB_USER' already exists. Skipping creation."
     else
         info "Creating MySQL user '$DB_USER'..."
-        if ! echo "CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';" | "${MYSQL_ROOT_CMD[@]}"; then
+        # Escape single quotes in the password
+        ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/\\\\'/g")
+
+        if ! echo "CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$ESCAPED_DB_PASS';" | "${MYSQL_ROOT_CMD[@]}"; then
             error "Failed to create MySQL user '$DB_USER'. Please check if the user already exists or if the credentials are correct."
             return 1
         fi
@@ -895,6 +898,7 @@ create_mysql_user() {
 install_firefly() {
     # Update package lists
     info "Updating package lists..."
+    apt update
 
     # Install required packages
     info "Installing required packages..."
@@ -903,7 +907,7 @@ install_firefly() {
     # Check if the necessary locales are already generated
     if ! locale -a | grep -qi "en_US\\.UTF-8"; then
         info "Locales not found. Generating locales (this might take a while)..."
-        apt install -y language-pack-en-base
+        apt install -y language-pack-en
         locale-gen en_US.UTF-8
     else
         info "Locales already generated. Skipping locale generation."
@@ -949,7 +953,58 @@ install_firefly() {
 
         if [ "$UPGRADE_PHP" = true ]; then
             info "Upgrading to PHP $LATEST_PHP_VERSION..."
-            # Proceed with upgrade logic
+
+            # Install the latest stable PHP version and required extensions
+            apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+                php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+                php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+                php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+
+            # Handle retaining or disabling older PHP versions
+            if [ "$NON_INTERACTIVE" = true ]; then
+                RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
+            else
+                prompt "Do you want to retain older PHP versions? (y/N): "
+                read RETAIN_OLD_PHP
+                RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
+            fi
+
+            if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
+                info "Retaining all older PHP versions. This might increase disk usage and may cause conflicts if other applications depend on older PHP versions."
+            else
+                warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
+
+                # Proceed with disabling old PHP versions
+                for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
+                    # Backup the current PHP configuration before disabling it
+                    PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
+                    if [ -f "$PHP_CONF" ]; then
+                        cp "$PHP_CONF" "${PHP_CONF}.bak"
+                        info "Backed up $PHP_CONF to ${PHP_CONF}.bak"
+                    fi
+                    a2dismod "php${version}"
+                    info "Disabled PHP $version"
+                done
+                success "Older PHP versions have been disabled."
+            fi
+
+            # Enable the latest PHP version
+            info "Enabling PHP $LATEST_PHP_VERSION..."
+            a2enmod php"$LATEST_PHP_VERSION"
+
+            # Restart Apache to apply the new PHP configuration
+            info "Restarting Apache web server to apply PHP configuration..."
+            apachectl configtest || {
+                error "Apache configuration test failed. Please check the configuration."
+                return 1
+            }
+
+            if ! systemctl restart apache2; then
+                error "Failed to restart Apache. Please check the Apache error logs for more details."
+                return 1
+            fi
+
+            success "Apache successfully reloaded or started."
         else
             info "Skipping PHP upgrade. Using installed version: $CURRENT_PHP_VERSION"
             LATEST_PHP_VERSION=$CURRENT_PHP_VERSION
@@ -973,6 +1028,30 @@ install_firefly() {
         fi
 
         info "Installing PHP $LATEST_PHP_VERSION..."
+
+        # Install the latest stable PHP version and required extensions
+        apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+            php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+            php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+            php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+
+        # Enable the latest PHP version
+        info "Enabling PHP $LATEST_PHP_VERSION..."
+        a2enmod php"$LATEST_PHP_VERSION"
+
+        # Restart Apache to apply the new PHP configuration
+        info "Restarting Apache web server to apply PHP configuration..."
+        apachectl configtest || {
+            error "Apache configuration test failed. Please check the configuration."
+            return 1
+        }
+
+        if ! systemctl restart apache2; then
+            error "Failed to restart Apache. Please check the Apache error logs for more details."
+            return 1
+        fi
+
+        success "Apache successfully reloaded or started."
     fi
 
     # Remove any installed RC versions of PHP dynamically
@@ -994,49 +1073,11 @@ install_firefly() {
         info "No PHP RC versions installed."
     fi
 
-    # Install the latest stable PHP version and required extensions
-    apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
-        php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
-        php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
-        php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
-
-    # Handle retaining or disabling older PHP versions
-    if [ "$NON_INTERACTIVE" = true ]; then
-        RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
-    else
-        prompt "Do you want to retain older PHP versions? (y/N): "
-        read RETAIN_OLD_PHP
-        RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
-    fi
-
-    if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
-        info "Retaining all older PHP versions. This might increase disk usage and may cause conflicts if other applications depend on older PHP versions."
-    else
-        warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
-
-        # Proceed with disabling old PHP versions
-        for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
-            # Backup the current PHP configuration before disabling it
-            PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
-            if [ -f "$PHP_CONF" ]; then
-                cp "$PHP_CONF" "${PHP_CONF}.bak"
-                info "Backed up $PHP_CONF to ${PHP_CONF}.bak"
-            fi
-            a2dismod "php${version}"
-            info "Disabled PHP $version"
-        done
-        success "Older PHP versions have been disabled."
-    fi
-
-    # Enable the latest PHP version
-    info "Enabling PHP $LATEST_PHP_VERSION..."
-    a2enmod php"$LATEST_PHP_VERSION"
-
     # Install Apache2 and MariaDB
     info "Installing Apache2 and MariaDB..."
     apt install -y apache2 mariadb-server
 
-    # Install Certbot for Let's Encrypt SSL (or use a self-signed certificate if needed)
+    # Install Certbot for Let's Encrypt SSL
     apt install -y certbot python3-certbot-apache || {
         error "Failed to install Certbot. Please install manually and re-run the script."
         return 1
@@ -1105,36 +1146,12 @@ install_firefly() {
     php composer-setup.php --install-dir=/usr/local/bin --filename=composer
     rm composer-setup.php
 
-    # Restart Apache to apply the new PHP configuration
-    info "Restarting Apache web server to apply PHP configuration..."
-    apachectl configtest || {
-        error "Apache configuration test failed. Please check the configuration."
-        return 1
-    }
-
-    if ! systemctl restart apache2; then
-        error "Failed to restart Apache. Please check the Apache error logs for more details."
-        return 1
-    fi
-
     # Download and validate Firefly III
     download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || return 1
 
     # Extract the archive file
     archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
     extract_archive "$archive_file" "$FIREFLY_INSTALL_DIR" || return 1
-
-    # Check if composer is installed before running it
-    if ! command -v composer &>/dev/null; then
-        error "Composer is not installed. Please install Composer and try again."
-        return 1
-    fi
-
-    # Check if composer is installed before running it
-    if ! command -v composer &>/dev/null; then
-        error "Composer is not installed. Please install Composer and try again."
-        return 1
-    fi
 
     # Run composer install if vendor directory is missing
     if [ ! -d "$FIREFLY_INSTALL_DIR/vendor" ]; then
@@ -1160,19 +1177,39 @@ install_firefly() {
     info "Running artisan commands for Firefly III..."
     cd "$FIREFLY_INSTALL_DIR"
 
-    # Generate application key if not already set
-    if grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" && [ -n "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
-        info "APP_KEY already set. Skipping key generation."
-    else
-        if ! sudo -u www-data php artisan key:generate; then
-            error "Failed to generate application key with php artisan. Please check your configuration."
-            return 1
-        fi
-    fi
+    # Check if APP_KEY is already set in the .env file and not the placeholder
+    if grep -q '^APP_KEY=SomeRandomStringOf32CharsExactly' "$FIREFLY_INSTALL_DIR/.env" ||
+        ! grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" ||
+        [ -z "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
 
-    # Capture the APP_KEY
-    APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
-    export APP_KEY
+        info "APP_KEY is missing or using a placeholder. Generating a new APP_KEY."
+
+        # Ensure the .env file exists and is writable
+        if [ ! -f "$FIREFLY_INSTALL_DIR/.env" ]; then
+            cp "$FIREFLY_INSTALL_DIR/.env.example" "$FIREFLY_INSTALL_DIR/.env"
+            info ".env file created from .env.example."
+        fi
+
+        # Generate the application key using php artisan and strip the base64: prefix
+        raw_key=$(sudo -u www-data php artisan key:generate --show)
+        APP_KEY=$(echo "$raw_key" | sed 's/base64://')
+
+        # Set the new APP_KEY in the .env file
+        sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "$FIREFLY_INSTALL_DIR/.env"
+
+        # Capture the newly generated APP_KEY
+        if [ -z "$APP_KEY" ]; then
+            error "Failed to retrieve APP_KEY from .env file."
+            return 1
+        else
+            info "APP_KEY generated and set successfully."
+            export APP_KEY
+        fi
+
+    else
+        info "APP_KEY already set and valid. Skipping key generation."
+        export APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
+    fi
 
     # Check if migrations have already been run
     info "Checking if database migrations have already been applied..."
@@ -1214,6 +1251,10 @@ install_firefly() {
 
     if [ "$PASSPORT_TABLE_EXISTS" -eq 0 ]; then
         info "Passport tables do not exist. Installing Laravel Passport..."
+
+        # Escape single quotes in the password
+        ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
+
         if ! sudo -u www-data php artisan passport:install --force --no-interaction; then
             error "Failed to install Laravel Passport. Please check your configuration."
             return 1
@@ -1274,7 +1315,7 @@ EOF
         # Disable the default site
         a2dissite 000-default.conf || true
 
-        # Update the APP_URL in .env to use HTTPS and the domain name without '/firefly-iii'
+        # Update the APP_URL in .env to use HTTPS and the domain name
         sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN_NAME|" "$FIREFLY_INSTALL_DIR/.env"
         info "APP_URL set to https://$DOMAIN_NAME in .env."
     else
@@ -1303,7 +1344,7 @@ EOF
         # Disable the default site
         a2dissite 000-default.conf || true
 
-        # Update the APP_URL in .env to use HTTP and the server IP address without '/firefly-iii'
+        # Update the APP_URL in .env to use HTTP and the server IP address
         sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}|" "$FIREFLY_INSTALL_DIR/.env"
         info "APP_URL set to http://${server_ip} in .env."
     fi
@@ -1332,21 +1373,45 @@ setup_importer_env_file() {
     local target_dir="$1"
 
     if [ ! -f "$target_dir/.env" ]; then
-        info "No .env file found in $target_dir, using .env.example as a template."
-        cp "$target_dir/.env.example" "$target_dir/.env"
-        info "Created new .env file from .env.example."
+        info "No .env file found in $target_dir, attempting to find .env.example as a template."
+
+        # Search for .env.example in the target directory and subdirectories
+        env_example_path=$(find "$target_dir" -name ".env.example" -print -quit)
+
+        if [ -n "$env_example_path" ]; then
+            cp "$env_example_path" "$target_dir/.env"
+            info "Created new .env file from .env.example at $env_example_path."
+        else
+            warning ".env.example not found, creating a new .env file with default settings."
+            # Create a default .env file
+            cat >"$target_dir/.env" <<EOF
+APP_ENV=production
+APP_KEY=
+APP_DEBUG=false
+APP_URL=http://${server_ip}/data-importer
+
+FIREFLY_III_URL=http://${server_ip}
+EOF
+            info "Created new .env file with default settings."
+        fi
     else
         info ".env file already exists in $target_dir."
     fi
 
-    # Set FIREFLY_III_URL to the root URL of Firefly III
+    # Set APP_URL and FIREFLY_III_URL for the Importer
     if [ "$HAS_DOMAIN" = true ]; then
-        validate_env_var "FIREFLY_III_URL" "https://$DOMAIN_NAME"
-        info "FIREFLY_III_URL set to https://$DOMAIN_NAME in .env."
+        FIREFLY_III_URL="https://$DOMAIN_NAME"
+        APP_URL="https://$DOMAIN_NAME:8080"
     else
-        validate_env_var "FIREFLY_III_URL" "http://${server_ip}"
-        info "FIREFLY_III_URL set to http://${server_ip} in .env."
+        FIREFLY_III_URL="http://${server_ip}"
+        APP_URL="http://${server_ip}:8080"
     fi
+
+    validate_env_var "FIREFLY_III_URL" "$FIREFLY_III_URL"
+    validate_env_var "APP_URL" "$APP_URL"
+
+    info "FIREFLY_III_URL set to $FIREFLY_III_URL in .env."
+    info "APP_URL set to $APP_URL in .env."
 
     # Set ownership and permissions for the .env file
     chown www-data:www-data "$target_dir/.env"
@@ -1356,6 +1421,29 @@ setup_importer_env_file() {
 
     # Indicate successful completion
     return 0
+}
+
+# Function to check Certbot auto-renewal mechanism
+check_certbot_auto_renewal() {
+    info "Checking for Certbot auto-renewal mechanism..."
+
+    # Check for systemd timer
+    if systemctl list-timers | grep -q certbot; then
+        info "Certbot systemd timer found. Auto-renewal is already configured."
+    else
+        # Check for existing cron job for Certbot
+        if crontab -l | grep -q "certbot renew"; then
+            info "Certbot cron job for auto-renewal found. No further action needed."
+        else
+            # Add a cron job to auto-renew the SSL certificate if neither exists
+            info "No existing auto-renewal mechanism found. Setting up cron job for Certbot renewal..."
+            (
+                crontab -l 2>/dev/null
+                echo "0 */12 * * * certbot renew --quiet --renew-hook 'systemctl reload apache2'"
+            ) | crontab -
+            info "Cron job for Certbot renewal added. It will run twice a day."
+        fi
+    fi
 }
 
 # Function to install Firefly Importer
@@ -1373,45 +1461,77 @@ install_firefly_importer() {
     info "Installing Firefly Importer to $IMPORTER_INSTALL_DIR..."
     mv "$IMPORTER_TEMP_DIR"/* "$IMPORTER_INSTALL_DIR/"
 
-    # Set ownership and permissions **before** running composer
+    # Set ownership and permissions
     info "Setting ownership and permissions for Firefly Importer..."
     chown -R www-data:www-data "$IMPORTER_INSTALL_DIR"
     find "$IMPORTER_INSTALL_DIR" -type f -exec chmod 644 {} \;
     find "$IMPORTER_INSTALL_DIR" -type d -exec chmod 755 {} \;
     chmod -R 775 "$IMPORTER_INSTALL_DIR/storage" "$IMPORTER_INSTALL_DIR/bootstrap/cache"
 
-    # Run composer install in the Firefly Importer directory
-    info "Installing Composer dependencies for Firefly Importer..."
-    if ! command -v composer &>/dev/null; then
-        error "Composer is not installed. Please install Composer and try again."
+    # Setup the .env file before running artisan commands
+    setup_importer_env_file "$IMPORTER_INSTALL_DIR"
+
+    # Ensure Composer is installed before attempting Firefly Importer installation
+    info "Ensuring Composer is installed for Firefly Importer dependencies..."
+    EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
+    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    ACTUAL_SIGNATURE=$(php -r "echo hash_file('sha384', 'composer-setup.php');")
+
+    if [ "$EXPECTED_SIGNATURE" != "$ACTUAL_SIGNATURE" ]; then
+        echo >&2 'ERROR: Invalid installer signature for Composer.'
+        rm composer-setup.php
         return 1
     fi
-    cd "$IMPORTER_INSTALL_DIR"
+
+    php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    rm composer-setup.php
+
+    info "Installing Composer dependencies for Firefly Importer..."
     sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader || {
         error "Composer install failed for Firefly Importer. Please check the error messages above."
         return 1
     }
 
-    # Generate application key
+    # Generate application key with --force
     info "Generating application key for Firefly Importer..."
-    sudo -u www-data php artisan key:generate --no-interaction || {
+    sudo -u www-data php artisan key:generate --no-interaction --force || {
         error "Failed to generate application key for Firefly Importer."
         return 1
     }
 
-    # Setup the .env file
-    setup_importer_env_file "$IMPORTER_INSTALL_DIR"
+    # Configure Apache for Firefly Importer
+    info "Configuring Apache for Firefly Importer..."
 
-    # Configure Apache to serve Firefly Importer under '/data-importer'
-    info "Configuring Apache for Firefly Importer under '/data-importer'..."
+    if [ "$HAS_DOMAIN" = true ]; then
+        # Configuration when a domain name is provided
+        # You may want to use a subdomain or a different domain for the importer
+        if [ -z "$DOMAIN_NAME" ]; then
+            error "DOMAIN_NAME is not set. Cannot configure IMPORTER_DOMAIN."
+            return 1
+        fi
+        IMPORTER_DOMAIN="${IMPORTER_DOMAIN:-importer.$DOMAIN_NAME}"
 
-    # Create Apache configuration with Alias for importer
-    cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
+        # Obtain SSL certificate for the importer domain
+        info "Obtaining SSL certificate for $IMPORTER_DOMAIN using Let's Encrypt..."
+        if ! certbot --apache --non-interactive --agree-tos --email "$EMAIL_ADDRESS" -d "$IMPORTER_DOMAIN"; then
+            error "Failed to obtain SSL certificate for $IMPORTER_DOMAIN. Please check domain DNS settings, firewall rules, or network connectivity and try again."
+            return 1
+        fi
+        success "SSL certificate successfully obtained for $IMPORTER_DOMAIN."
+
+        cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
 <VirtualHost *:80>
-    ServerAdmin webmaster@localhost
-    DocumentRoot $FIREFLY_INSTALL_DIR/public
+    ServerName $IMPORTER_DOMAIN
+    Redirect permanent / https://$IMPORTER_DOMAIN/
+</VirtualHost>
 
-    Alias /data-importer $IMPORTER_INSTALL_DIR/public
+<VirtualHost *:443>
+    ServerName $IMPORTER_DOMAIN
+    DocumentRoot $IMPORTER_INSTALL_DIR/public
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/$IMPORTER_DOMAIN/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/$IMPORTER_DOMAIN/privkey.pem
 
     <Directory $IMPORTER_INSTALL_DIR/public>
         Options -Indexes +FollowSymLinks
@@ -1424,11 +1544,66 @@ install_firefly_importer() {
 </VirtualHost>
 EOF
 
-    # Enable the site and required modules
-    a2enmod rewrite
-    a2ensite firefly-importer
+        # Enable the SSL module and the new site configuration
+        a2enmod ssl
+        a2enmod rewrite
+        a2ensite firefly-importer
+
+        # Update the APP_URL in .env to use HTTPS and the importer domain
+        sed -i "s|APP_URL=.*|APP_URL=https://$IMPORTER_DOMAIN|" "$IMPORTER_INSTALL_DIR/.env"
+        info "APP_URL set to https://$IMPORTER_DOMAIN in .env."
+    else
+        # Configuration when no domain name is provided
+        IMPORTER_PORT=8080
+
+        info "Configuring Apache for Firefly Importer on port $IMPORTER_PORT..."
+
+        # Add Listen directive if not present
+        if ! grep -q "^Listen $IMPORTER_PORT" /etc/apache2/ports.conf; then
+            echo "Listen $IMPORTER_PORT" >>/etc/apache2/ports.conf
+        fi
+
+        cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
+<VirtualHost *:$IMPORTER_PORT>
+    ServerAdmin webmaster@localhost
+    DocumentRoot $IMPORTER_INSTALL_DIR/public
+
+    <Directory $IMPORTER_INSTALL_DIR/public>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog \${APACHE_LOG_DIR}/firefly-importer-error.log
+    CustomLog \${APACHE_LOG_DIR}/firefly-importer-access.log combined
+</VirtualHost>
+EOF
+
+        a2ensite firefly-importer
+        a2enmod rewrite
+
+        # Open the port in the firewall
+        info "Opening port $IMPORTER_PORT in the firewall..."
+        ufw allow $IMPORTER_PORT/tcp || {
+            warning "Failed to open port $IMPORTER_PORT in the firewall. You may need to open it manually."
+        }
+
+        # Update the APP_URL in .env
+        sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}:$IMPORTER_PORT|" "$IMPORTER_INSTALL_DIR/.env"
+        info "APP_URL set to http://${server_ip}:$IMPORTER_PORT in .env."
+    fi
 
     # Restart Apache to apply changes
+    restart_apache || return 1
+
+    success "Firefly Importer installation completed."
+
+    # Indicate successful completion
+    return 0
+}
+
+# Helper function to restart Apache and perform configuration test
+restart_apache() {
     info "Restarting Apache web server..."
     apachectl configtest || {
         error "Apache configuration test failed. Please check the configuration."
@@ -1436,15 +1611,10 @@ EOF
     }
 
     if ! systemctl restart apache2; then
-        {
         error "Failed to restart Apache. Please check the Apache error logs for more details."
         return 1
-    }
-
-    success "Firefly Importer installation completed."
-
-    # Indicate successful completion
-    return 0
+    fi
+    success "Apache restarted successfully."
 }
 
 # Function to update Firefly Importer
@@ -1519,34 +1689,77 @@ update_firefly_importer() {
         # Move the new installation to the install directory
         mv "$IMPORTER_TEMP_DIR" "$IMPORTER_INSTALL_DIR"
 
-        # Adjust Apache configuration to serve Firefly Importer with HTTPS
-        info "Configuring Apache for Firefly Importer with HTTPS..."
+        # Configure Apache for Firefly Importer
+        info "Configuring Apache for Firefly Importer..."
 
-        # Check if SSL certificates exist before configuring Apache
-        if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
-            error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-            return 1
-        fi
+        if [ "$HAS_DOMAIN" = true ]; then
+            # Configuration when a domain name is provided
+            # You may want to use a subdomain or a different domain for the importer
+            if [ -z "$DOMAIN_NAME" ]; then
+                error "DOMAIN_NAME is not set. Cannot configure IMPORTER_DOMAIN."
+                return 1
+            fi
+            IMPORTER_DOMAIN="${IMPORTER_DOMAIN:-importer.$DOMAIN_NAME}"
 
-        # Backup existing Apache configuration if present
-        if [ -f /etc/apache2/sites-available/firefly-importer.conf ]; then
-            cp /etc/apache2/sites-available/firefly-importer.conf /etc/apache2/sites-available/firefly-importer.conf.bak
-        fi
+            # Ensure SSL certificates exist before configuring Apache
+            if [ ! -f "/etc/letsencrypt/live/$IMPORTER_DOMAIN/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$IMPORTER_DOMAIN/privkey.pem" ]; then
+                info "Obtaining SSL certificate for $IMPORTER_DOMAIN using Let's Encrypt..."
+                if ! certbot --apache --non-interactive --agree-tos --email "$EMAIL_ADDRESS" -d "$IMPORTER_DOMAIN"; then
+                    error "Failed to obtain SSL certificate for $IMPORTER_DOMAIN. Please check domain DNS settings, firewall rules, or network connectivity and try again."
+                    return 1
+                fi
+                success "SSL certificate successfully obtained for $IMPORTER_DOMAIN."
+            fi
 
-        # Create new Apache configuration
-        cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
+            # Create new Apache configuration
+            cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
 <VirtualHost *:80>
-    ServerName $DOMAIN_NAME
-    Redirect permanent / https://$DOMAIN_NAME/data-importer
+ServerName $IMPORTER_DOMAIN
+Redirect permanent / https://$IMPORTER_DOMAIN/
 </VirtualHost>
 
 <VirtualHost *:443>
-    ServerName $DOMAIN_NAME
-    DocumentRoot $IMPORTER_INSTALL_DIR/public
+ServerName $IMPORTER_DOMAIN
+DocumentRoot $IMPORTER_INSTALL_DIR/public
 
-    SSLEngine on
-    SSLCertificateFile /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem
+SSLEngine on
+SSLCertificateFile /etc/letsencrypt/live/$IMPORTER_DOMAIN/fullchain.pem
+SSLCertificateKeyFile /etc/letsencrypt/live/$IMPORTER_DOMAIN/privkey.pem
+
+<Directory $IMPORTER_INSTALL_DIR/public>
+    Options -Indexes +FollowSymLinks
+    AllowOverride All
+    Require all granted
+</Directory>
+
+ErrorLog \${APACHE_LOG_DIR}/firefly-importer-error.log
+CustomLog \${APACHE_LOG_DIR}/firefly-importer-access.log combined
+</VirtualHost>
+EOF
+
+            # Enable the SSL module and the new site configuration
+            a2enmod ssl
+            a2enmod rewrite
+            a2ensite firefly-importer
+
+            # Update the APP_URL in .env to use HTTPS and the importer domain
+            sed -i "s|APP_URL=.*|APP_URL=https://$IMPORTER_DOMAIN|" "$IMPORTER_INSTALL_DIR/.env"
+            info "APP_URL set to https://$IMPORTER_DOMAIN in .env."
+        else
+            # Configuration when no domain name is provided
+            IMPORTER_PORT=8080
+
+            info "Configuring Apache for Firefly Importer on port $IMPORTER_PORT..."
+
+            # Add Listen directive if not present
+            if ! grep -q "^Listen $IMPORTER_PORT" /etc/apache2/ports.conf; then
+                echo "Listen $IMPORTER_PORT" >>/etc/apache2/ports.conf
+            fi
+
+            cat >/etc/apache2/sites-available/firefly-importer.conf <<EOF
+<VirtualHost *:$IMPORTER_PORT>
+    ServerAdmin webmaster@localhost
+    DocumentRoot $IMPORTER_INSTALL_DIR/public
 
     <Directory $IMPORTER_INSTALL_DIR/public>
         Options -Indexes +FollowSymLinks
@@ -1559,47 +1772,24 @@ update_firefly_importer() {
 </VirtualHost>
 EOF
 
-        # Enable the SSL module and the new site configuration
-        a2enmod ssl
-        a2ensite firefly-importer
+            a2ensite firefly-importer
+            a2enmod rewrite
+
+            # Open the port in the firewall
+            info "Opening port $IMPORTER_PORT in the firewall..."
+            ufw allow $IMPORTER_PORT/tcp || {
+                warning "Failed to open port $IMPORTER_PORT in the firewall. You may need to open it manually."
+            }
+
+            # Update the APP_URL in .env
+            sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}:$IMPORTER_PORT|" "$IMPORTER_INSTALL_DIR/.env"
+            info "APP_URL set to http://${server_ip}:$IMPORTER_PORT in .env."
+        fi
 
         # Restart Apache to apply changes and add proper error handling
-        info "Restarting Apache web server..."
-        apachectl configtest || {
-            error "Apache configuration test failed. Please check the configuration."
-            return 1
-        }
+        restart_apache || return 1
 
-        # Attempt to reload Apache, and if that fails, try starting it
-        if ! systemctl restart apache2; then
-            error "Failed to restart Apache. Please check the Apache error logs for more details."
-            return 1
-        fi
-
-        success "Apache successfully reloaded or started."
-
-        # Verify if Certbot's systemd timer or cron job for renewal exists
-        info "Checking for Certbot auto-renewal mechanism..."
-
-        # Check for systemd timer
-        if systemctl list-timers | grep -q certbot; then
-            info "Certbot systemd timer found. Auto-renewal is already configured."
-        else
-            # Check for existing cron job for Certbot
-            if crontab -l | grep -q "certbot renew"; then
-                info "Certbot cron job for auto-renewal found. No further action needed."
-            else
-                # Add a cron job to auto-renew the SSL certificate if neither exists
-                info "No existing auto-renewal mechanism found. Setting up cron job for Certbot renewal..."
-                (
-                    crontab -l 2>/dev/null
-                    echo "0 */12 * * * certbot renew --quiet --renew-hook 'systemctl reload apache2'"
-                ) | crontab -
-                info "Cron job for Certbot renewal added. It will run twice a day."
-            fi
-        fi
-
-        success "Firefly Importer update completed. The old installation has been moved to ${IMPORTER_INSTALL_DIR}-old"
+        success "Firefly Importer update completed."
 
     else
         info "Update canceled by the user."
@@ -1662,29 +1852,6 @@ setup_cron_job() {
     return 0
 }
 
-# Function to check Certbot auto-renewal mechanism
-check_certbot_auto_renewal() {
-    info "Checking for Certbot auto-renewal mechanism..."
-
-    # Check for systemd timer
-    if systemctl list-timers | grep -q certbot; then
-        info "Certbot systemd timer found. Auto-renewal is already configured."
-    else
-        # Check for existing cron job for Certbot
-        if crontab -l | grep -q "certbot renew"; then
-            info "Certbot cron job for auto-renewal found. No further action needed."
-        else
-            # Add a cron job to auto-renew the SSL certificate if neither exists
-            info "No existing auto-renewal mechanism found. Setting up cron job for Certbot renewal..."
-            (
-                crontab -l 2>/dev/null
-                echo "0 */12 * * * certbot renew --quiet --renew-hook 'systemctl reload apache2'"
-            ) | crontab -
-            info "Cron job for Certbot renewal added. It will run twice a day."
-        fi
-    fi
-}
-
 # Function to create a backup of the current installation
 create_backup() {
     local src_dir="$1"
@@ -1703,7 +1870,6 @@ create_backup() {
 
 # Function to save credentials to a file
 save_credentials() {
-    CREDENTIALS_FILE="/root/firefly_credentials.txt"
     info "Saving credentials to $CREDENTIALS_FILE..."
 
     {
@@ -1728,7 +1894,7 @@ save_credentials() {
 
         if [ -n "$PASSPHRASE" ]; then
             info "Encrypting credentials file with gpg for security..."
-            if echo "$PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 -c "$CREDENTIALS_FILE"; then
+            if gpg --batch --yes --passphrase "$PASSPHRASE" -c "$CREDENTIALS_FILE"; then
                 rm "$CREDENTIALS_FILE"
                 success "Credentials saved and encrypted at $CREDENTIALS_FILE.gpg."
                 warning "Please keep this file safe and decrypt it using 'gpg --decrypt $CREDENTIALS_FILE.gpg'."
@@ -1744,6 +1910,11 @@ save_credentials() {
 
     # Secure the credentials file (plaintext or encrypted)
     chmod 600 "${CREDENTIALS_FILE}"*
+
+    success "Credentials have been saved to $CREDENTIALS_FILE."
+
+    # Indicate successful completion
+    return 0
 }
 
 # Function to update Firefly III
@@ -1761,6 +1932,9 @@ update_firefly() {
 
     if [[ "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
         info "Proceeding to update..."
+
+        # Create a backup of the current installation
+        create_backup "$FIREFLY_INSTALL_DIR"
 
         # Update package lists
         info "Updating package lists..."
@@ -1799,7 +1973,58 @@ update_firefly() {
 
             if [ "$UPGRADE_PHP" = true ]; then
                 info "Upgrading to PHP $LATEST_PHP_VERSION..."
-                # Proceed with upgrade logic
+
+                # Install the latest stable PHP version and required extensions
+                apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+                    php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+                    php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+                    php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+
+                # Handle retaining or disabling older PHP versions
+                if [ "$NON_INTERACTIVE" = true ]; then
+                    RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
+                else
+                    prompt "Do you want to retain older PHP versions? (y/N): "
+                    read RETAIN_OLD_PHP
+                    RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
+                fi
+
+                if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
+                    info "Retaining all older PHP versions. This might increase disk usage and may cause conflicts if other applications depend on older PHP versions."
+                else
+                    warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
+
+                    # Proceed with disabling old PHP versions
+                    for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
+                        # Backup the current PHP configuration before disabling it
+                        PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
+                        if [ -f "$PHP_CONF" ]; then
+                            cp "$PHP_CONF" "${PHP_CONF}.bak"
+                            info "Backed up $PHP_CONF to ${PHP_CONF}.bak"
+                        fi
+                        a2dismod "php${version}"
+                        info "Disabled PHP $version"
+                    done
+                    success "Older PHP versions have been disabled."
+                fi
+
+                # Enable the latest PHP version
+                info "Enabling PHP $LATEST_PHP_VERSION..."
+                a2enmod php"$LATEST_PHP_VERSION"
+
+                # Restart Apache to apply the new PHP configuration
+                info "Restarting Apache web server to apply PHP configuration..."
+                apachectl configtest || {
+                    error "Apache configuration test failed. Please check the configuration."
+                    return 1
+                }
+
+                if ! systemctl restart apache2; then
+                    error "Failed to restart Apache. Please check the Apache error logs for more details."
+                    return 1
+                fi
+
+                success "Apache successfully reloaded or started."
             else
                 info "Skipping PHP upgrade. Using installed version: $CURRENT_PHP_VERSION"
                 LATEST_PHP_VERSION=$CURRENT_PHP_VERSION
@@ -1823,9 +2048,31 @@ update_firefly() {
             fi
 
             info "Installing PHP $LATEST_PHP_VERSION..."
-        fi
 
-        # **Insert the Dynamic Removal of RC Versions code here**
+            # Install the latest stable PHP version and required extensions
+            apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
+                php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
+                php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
+                php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
+
+            # Enable the latest PHP version
+            info "Enabling PHP $LATEST_PHP_VERSION..."
+            a2enmod php"$LATEST_PHP_VERSION"
+
+            # Restart Apache to apply the new PHP configuration
+            info "Restarting Apache web server to apply PHP configuration..."
+            apachectl configtest || {
+                error "Apache configuration test failed. Please check the configuration."
+                return 1
+            }
+
+            if ! systemctl restart apache2; then
+                error "Failed to restart Apache. Please check the Apache error logs for more details."
+                return 1
+            fi
+
+            success "Apache successfully reloaded or started."
+        fi
 
         # Remove any installed RC versions of PHP dynamically
         info "Checking for any installed RC versions of PHP..."
@@ -1846,48 +2093,6 @@ update_firefly() {
             info "No PHP RC versions installed."
         fi
 
-        # Install the latest PHP version and required extensions
-        apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
-            php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
-            php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
-            php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
-
-        # Get the latest installed PHP version
-        LATEST_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
-        info "Detected latest PHP version: $LATEST_PHP_VERSION"
-
-        # Handle retaining or disabling older PHP versions
-        if [ "$NON_INTERACTIVE" = true ]; then
-            RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
-        else
-            prompt "Do you want to retain older PHP versions? (y/N): "
-            read RETAIN_OLD_PHP
-            RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
-        fi
-
-        if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
-            info "Retaining all older PHP versions. This might increase disk usage and may cause conflicts if other applications depend on older PHP versions."
-        else
-            warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
-
-            # Proceed with disabling old PHP versions
-            for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
-                # Backup the current PHP configuration before disabling it
-                PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
-                if [ -f "$PHP_CONF" ]; then
-                    cp "$PHP_CONF" "${PHP_CONF}.bak"
-                    info "Backed up $PHP_CONF to ${PHP_CONF}.bak"
-                fi
-                a2dismod "php${version}"
-                info "Disabled PHP $version"
-            done
-            success "Older PHP versions have been disabled."
-        fi
-
-        # Enable the latest PHP version
-        info "Enabling PHP $LATEST_PHP_VERSION..."
-        a2enmod php"$LATEST_PHP_VERSION"
-
         # Create a backup of the current installation
         create_backup "$FIREFLY_INSTALL_DIR"
 
@@ -1898,9 +2103,6 @@ update_firefly() {
         archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
         extract_archive "$archive_file" "$FIREFLY_TEMP_DIR" || return 1
 
-        # Search for the .env.example file
-        env_example_path=$(find "$FIREFLY_TEMP_DIR" -name ".env.example" -print -quit)
-
         # Copy over the .env file
         info "Copying configuration files..."
         if [ -f "$FIREFLY_INSTALL_DIR/.env" ]; then
@@ -1910,12 +2112,17 @@ update_firefly() {
         else
             warning "No .env file found in $FIREFLY_INSTALL_DIR. Creating a new .env file from .env.example..."
 
-            # Check if the .env.example file was found
+            # Search for .env.example using find to ensure it exists
+            env_example_path=$(find "$FIREFLY_TEMP_DIR" -name ".env.example" -print -quit)
+
             if [ -n "$env_example_path" ]; then
                 cp "$env_example_path" "$FIREFLY_TEMP_DIR/.env"
                 chown www-data:www-data "$FIREFLY_TEMP_DIR/.env"
                 chmod 640 "$FIREFLY_TEMP_DIR/.env"
-                setup_env_file "$FIREFLY_TEMP_DIR" # Populate the new .env file with necessary configurations
+                info "Created new .env file from .env.example."
+
+                # Call the setup_env_file function to populate the .env file
+                setup_env_file "$FIREFLY_TEMP_DIR"
             else
                 error ".env.example not found. Please ensure the example file is present."
                 return 1
@@ -1942,19 +2149,39 @@ update_firefly() {
         info "Running artisan commands for Firefly III..."
         cd "$FIREFLY_INSTALL_DIR"
 
-        # Generate application key if not already set
-        if grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" && [ -n "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
-            info "APP_KEY already set. Skipping key generation."
-        else
-            if ! sudo -u www-data php artisan key:generate; then
-                error "Failed to generate application key with php artisan. Please check your configuration."
-                return 1
-            fi
-        fi
+        # Check if APP_KEY is already set in the .env file and not the placeholder
+        if grep -q '^APP_KEY=SomeRandomStringOf32CharsExactly' "$FIREFLY_INSTALL_DIR/.env" ||
+            ! grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" ||
+            [ -z "$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)" ]; then
 
-        # Capture the APP_KEY
-        APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
-        export APP_KEY
+            info "APP_KEY is missing or using a placeholder. Generating a new APP_KEY."
+
+            # Ensure the .env file exists and is writable
+            if [ ! -f "$FIREFLY_INSTALL_DIR/.env" ]; then
+                cp "$FIREFLY_INSTALL_DIR/.env.example" "$FIREFLY_INSTALL_DIR/.env"
+                info ".env file created from .env.example."
+            fi
+
+            # Generate the application key using php artisan and strip the base64: prefix
+            raw_key=$(sudo -u www-data php artisan key:generate --show)
+            APP_KEY=$(echo "$raw_key" | sed 's/base64://')
+
+            # Set the new APP_KEY in the .env file
+            sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "$FIREFLY_INSTALL_DIR/.env"
+
+            # Capture the newly generated APP_KEY
+            if [ -z "$APP_KEY" ]; then
+                error "Failed to retrieve APP_KEY from .env file."
+                return 1
+            else
+                info "APP_KEY generated and set successfully."
+                export APP_KEY
+            fi
+
+        else
+            info "APP_KEY already set and valid. Skipping key generation."
+            export APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
+        fi
 
         # Check if migrations have already been run
         info "Checking if database migrations have already been applied..."
@@ -1996,7 +2223,35 @@ update_firefly() {
 
         # Check if Passport tables already exist
         info "Checking if Laravel Passport tables already exist..."
-        PASSPORT_TABLE_EXISTS=$(mysql -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -e "SHOW TABLES LIKE 'oauth_auth_codes';" | grep -c "oauth_auth_codes")
+        # Read database credentials from .env file
+        if [ -f "$FIREFLY_INSTALL_DIR/.env" ]; then
+            DB_CONNECTION=$(grep '^DB_CONNECTION=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_HOST=$(grep '^DB_HOST=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PORT=$(grep '^DB_PORT=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_NAME=$(grep '^DB_DATABASE=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_USER=$(grep '^DB_USERNAME=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+            DB_PASS=$(grep '^DB_PASSWORD=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2-)
+        else
+            error ".env file not found in $FIREFLY_INSTALL_DIR. Cannot read database credentials."
+            return 1
+        fi
+
+        # Create a temporary MySQL configuration file
+        TEMP_MY_CNF=$(mktemp)
+        chmod 600 "$TEMP_MY_CNF"
+        cat >"$TEMP_MY_CNF" <<EOF
+[client]
+host=$DB_HOST
+port=$DB_PORT
+user=$DB_USER
+password=$DB_PASS
+EOF
+
+        # Attempt to connect using the temporary configuration file
+        PASSPORT_TABLE_EXISTS=$(mysql --defaults-extra-file="$TEMP_MY_CNF" -D "$DB_NAME" -e "SHOW TABLES LIKE 'oauth_auth_codes';" | grep -c "oauth_auth_codes")
+
+        # Remove the temporary configuration file
+        rm -f "$TEMP_MY_CNF"
 
         if [ "$PASSPORT_TABLE_EXISTS" -eq 0 ]; then
             info "Passport tables do not exist. Installing Laravel Passport..."
@@ -2018,22 +2273,23 @@ update_firefly() {
             rm -f "$FIREFLY_INSTALL_DIR/database/migrations/2016_06_01_000005_create_oauth_personal_access_clients_table.php"
         fi
 
-        # Adjust Apache configuration to serve Firefly III with HTTPS
-        info "Configuring Apache for Firefly III with HTTPS..."
-
-        # Check if SSL certificates exist before configuring Apache
-        if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
-            error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
-            return 1
-        fi
+        # Adjust Apache configuration to serve Firefly III
+        info "Configuring Apache for Firefly III..."
 
         # Backup existing Apache configuration if present
         if [ -f /etc/apache2/sites-available/firefly-iii.conf ]; then
             cp /etc/apache2/sites-available/firefly-iii.conf /etc/apache2/sites-available/firefly-iii.conf.bak
         fi
 
-        # Create new Apache configuration
-        cat >/etc/apache2/sites-available/firefly-iii.conf <<EOF
+        if [ "$HAS_DOMAIN" = true ]; then
+            # Check if SSL certificates exist before configuring Apache
+            if [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
+                error "SSL certificates for $DOMAIN_NAME are missing. Please ensure Certbot has successfully obtained certificates."
+                return 1
+            fi
+
+            # Create new Apache configuration for domain
+            cat >/etc/apache2/sites-available/firefly-iii.conf <<EOF
 <VirtualHost *:80>
     ServerName $DOMAIN_NAME
     Redirect permanent / https://$DOMAIN_NAME/
@@ -2058,18 +2314,41 @@ update_firefly() {
 </VirtualHost>
 EOF
 
-        # Set APP_URL based on whether a domain is configured or not
-        if [ "$HAS_DOMAIN" = true ]; then
-            sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN_NAME/firefly-iii|" "$FIREFLY_INSTALL_DIR/.env"
-            info "APP_URL set to https://$DOMAIN_NAME/firefly-iii in .env."
-        else
-            sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}/firefly-iii|" "$FIREFLY_INSTALL_DIR/.env"
-            info "APP_URL set to http://${server_ip}/firefly-iii in .env."
-        fi
+            # Enable the SSL module and the new site configuration
+            a2enmod ssl
+            a2enmod rewrite
+            a2ensite firefly-iii
 
-        # Enable the SSL module and the new site configuration
-        a2enmod ssl
-        a2ensite firefly-iii
+            # Update the APP_URL in .env to use HTTPS and the domain name
+            sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN_NAME|" "$FIREFLY_INSTALL_DIR/.env"
+            info "APP_URL set to https://$DOMAIN_NAME in .env."
+        else
+            # Configuration when no domain name is provided
+            cat >/etc/apache2/sites-available/firefly-iii.conf <<EOF
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    DocumentRoot $FIREFLY_INSTALL_DIR/public
+
+    <Directory $FIREFLY_INSTALL_DIR/public>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog \${APACHE_LOG_DIR}/firefly-error.log
+    CustomLog \${APACHE_LOG_DIR}/firefly-access.log combined
+</VirtualHost>
+EOF
+
+            # Disable SSL module and ensure the site is enabled
+            a2dismod ssl || true
+            a2enmod rewrite
+            a2ensite firefly-iii
+
+            # Update the APP_URL in .env to use HTTP and the server IP address
+            sed -i "s|APP_URL=.*|APP_URL=http://${server_ip}|" "$FIREFLY_INSTALL_DIR/.env"
+            info "APP_URL set to http://${server_ip} in .env."
+        fi
 
         # Restart Apache to apply changes and add proper error handling
         info "Restarting Apache web server..."
@@ -2078,7 +2357,6 @@ EOF
             return 1
         }
 
-        # Attempt to reload Apache, and if that fails, try starting it
         if ! systemctl restart apache2; then
             error "Failed to restart Apache. Please check the Apache error logs for more details."
             return 1
@@ -2087,25 +2365,7 @@ EOF
         success "Apache successfully reloaded or started."
 
         # Verify if Certbot's systemd timer or cron job for renewal exists
-        info "Checking for Certbot auto-renewal mechanism..."
-
-        # Check for systemd timer
-        if systemctl list-timers | grep -q certbot; then
-            info "Certbot systemd timer found. Auto-renewal is already configured."
-        else
-            # Check for existing cron job for Certbot
-            if crontab -l | grep -q "certbot renew"; then
-                info "Certbot cron job for auto-renewal found. No further action needed."
-            else
-                # Add a cron job to auto-renew the SSL certificate if neither exists
-                info "No existing auto-renewal mechanism found. Setting up cron job for Certbot renewal..."
-                (
-                    crontab -l 2>/dev/null
-                    echo "0 */12 * * * certbot renew --quiet --renew-hook 'systemctl reload apache2'"
-                ) | crontab -
-                info "Cron job for Certbot renewal added. It will run twice a day."
-            fi
-        fi
+        check_certbot_auto_renewal
 
         success "Firefly III update completed. The old installation has been moved to ${FIREFLY_INSTALL_DIR}-old"
 
@@ -2131,9 +2391,6 @@ cleanup() {
         rm -rf "$IMPORTER_TEMP_DIR"
     fi
 }
-
-# Register the cleanup function to run on script exit
-trap cleanup EXIT
 
 # Ensure log file is set up and rotate if necessary
 setup_log_file
@@ -2273,10 +2530,15 @@ check_firefly_installation() {
             return 1
         fi
 
-        # Check if .env file contains necessary configurations
+        # Check if the .env file contains APP_KEY and it's not the placeholder
         if ! grep -q '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env"; then
             error "APP_KEY is missing from the .env file."
             return 1
+        elif grep -q '^APP_KEY=SomeRandomStringOf32CharsExactly' "$FIREFLY_INSTALL_DIR/.env"; then
+            error "APP_KEY is set to the placeholder value. Firefly III is not fully configured."
+            return 1
+        else
+            info "APP_KEY is set and valid."
         fi
 
         if ! grep -q '^DB_CONNECTION=' "$FIREFLY_INSTALL_DIR/.env"; then
@@ -2375,10 +2637,15 @@ check_firefly_importer_installation() {
             return 1
         fi
 
-        # Check if .env file contains necessary configurations
+        # Check if the .env file contains APP_KEY and it's not the placeholder
         if ! grep -q '^APP_KEY=' "$IMPORTER_INSTALL_DIR/.env"; then
             error "APP_KEY is missing from the .env file."
             return 1
+        elif grep -q '^APP_KEY=SomeRandomStringOf32CharsExactly' "$IMPORTER_INSTALL_DIR/.env"; then
+            error "APP_KEY is set to the placeholder value. Firefly Importer is not fully configured."
+            return 1
+        else
+            info "APP_KEY is set and valid."
         fi
 
         if ! grep -q '^FIREFLY_III_URL=' "$IMPORTER_INSTALL_DIR/.env"; then
@@ -2459,6 +2726,48 @@ EOF
     fi
 }
 
+# Function to print messages in a box with optional color and word wrapping
+print_message_box() {
+    local color="${1}"
+    local message="${2}"
+    local title="${3:-}"
+    local max_width=60 # Set a fixed width for wrapping content
+
+    # Function to wrap text by word and limit the length of each line
+    wrap_text() {
+        local text="$1"
+        local width="$2"
+        echo "$text" | fold -s -w "$width"
+    }
+
+    # Split message into lines and find max length
+    local wrapped_message=$(wrap_text "$message" $max_width)
+    local IFS=$'\n'
+    local lines=($wrapped_message)
+    local max_length=0
+    for line in "${lines[@]}"; do
+        [ ${#line} -gt $max_length ] && max_length=${#line}
+    done
+
+    # Print double border if it's a title section
+    if [ -n "$title" ]; then
+        local title_length=${#title}
+        local padding=$(((max_length - title_length) / 2))
+        local title_border=$(printf '=%.0s' $(seq 1 $((max_length + 4))))
+        echo -e "${color}${title_border}"
+        printf "| %-${padding}s%s%-${padding}s |\n" "" "$title" ""
+        echo -e "${title_border}"
+    fi
+
+    # Print the box with dynamic width based on max length of content
+    local border=$(printf '─%.0s' $(seq 1 $((max_length + 4))))
+    echo -e "${color}${border}"
+    for line in "${lines[@]}"; do
+        printf "| %-${max_length}s |\n" "$line"
+    done
+    echo -e "${border}${COLOR_RESET}"
+}
+
 #####################################################################################################################################################
 #
 #   SCRIPT EXECUTION
@@ -2482,6 +2791,7 @@ else
         # Decide whether to exit or proceed
         exit 1
     fi
+
 fi
 
 # Main check for Firefly Importer installation or update
@@ -2499,19 +2809,18 @@ else
     fi
 fi
 
-# Final message
-success "Installation and update process completed."
-info "You can access Firefly III at http://${server_ip}/firefly-iii"
-info "And Firefly Importer at http://${server_ip}/data-importer"
-info "Firefly III configuration file is located at: $FIREFLY_INSTALL_DIR/.env"
-info "Firefly Importer configuration file is located at: $IMPORTER_INSTALL_DIR/.env"
-info "A cron job has been set up to run scheduled tasks daily at $CRON_HOUR:00."
-info "If you need to modify the cron job, edit: /etc/cron.d/firefly-iii-cron"
-info "Database credentials and tokens have been saved to /root/firefly_credentials.txt"
-info "Please keep this file safe and consider changing the credentials for increased security."
+# Save credentials after installation
+save_credentials
 
-# Provide log file location to the user
-info "Log file for this run: ${LOG_FILE}"
-info "To view the log, use: 'cat ${LOG_FILE}' or 'less ${LOG_FILE}'"
-info "Log files older than 7 days have been automatically deleted."
-info "If you encounter issues, check the log file for troubleshooting."
+# Use this function as below for cleaner output:
+final_message="Installation and Update Process Completed"
+print_message_box "${COLOR_GREEN}" "${final_message}" "PROCESS COMPLETE"
+
+access_message="Firefly III: http://${server_ip}:80\nFirefly Importer: http://${server_ip}:8080"
+print_message_box "${COLOR_CYAN}" "${access_message}" "ACCESS INFORMATION"
+
+config_message="Configuration Files:\nFirefly III: ${FIREFLY_INSTALL_DIR}/.env\nFirefly Importer: ${IMPORTER_INSTALL_DIR}/.env\nCron Job: /etc/cron.d/firefly-iii-cron\nCredentials: /root/firefly_credentials.txt"
+print_message_box "${COLOR_YELLOW}" "${config_message}" "CONFIGURATION FILES"
+
+log_message="Log File: ${LOG_FILE}\nView Logs: cat ${LOG_FILE}\nLogs older than 7 days auto-deleted."
+print_message_box "${COLOR_BLUE}" "${log_message}" "LOG DETAILS"
