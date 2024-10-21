@@ -1190,11 +1190,17 @@ install_firefly() {
             info ".env file created from .env.example."
         fi
 
-        # Generate the application key using php artisan and strip the base64: prefix
-        raw_key=$(sudo -u www-data php artisan key:generate --show)
-        APP_KEY=$(echo "$raw_key" | sed 's/base64://')
+        # Generate the application key using php artisan, keep the base64: prefix
+        APP_KEY=$(sudo -u www-data php artisan key:generate --show)
 
-        # Set the new APP_KEY in the .env file
+        # Validate the generated APP_KEY (without base64: it should be 32 characters long)
+        decoded_key=$(echo "${APP_KEY#base64:}" | base64 --decode 2>/dev/null)
+        if [ ${#decoded_key} -ne 32 ]; then
+            error "Generated APP_KEY is invalid. Expected a base64-encoded 32-character key."
+            return 1
+        fi
+
+        # Set the new APP_KEY in the .env file, ensuring base64 prefix is retained
         sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "$FIREFLY_INSTALL_DIR/.env"
 
         # Capture the newly generated APP_KEY
@@ -1384,12 +1390,12 @@ setup_importer_env_file() {
         else
             warning ".env.example not found, creating a new .env file with default settings."
             # Create a default .env file
+            # Create a default .env file
             cat >"$target_dir/.env" <<EOF
 APP_ENV=production
 APP_KEY=
 APP_DEBUG=false
-APP_URL=http://${server_ip}/data-importer
-
+APP_URL=http://${server_ip}:8080
 FIREFLY_III_URL=http://${server_ip}
 EOF
             info "Created new .env file with default settings."
@@ -2162,11 +2168,17 @@ update_firefly() {
                 info ".env file created from .env.example."
             fi
 
-            # Generate the application key using php artisan and strip the base64: prefix
-            raw_key=$(sudo -u www-data php artisan key:generate --show)
-            APP_KEY=$(echo "$raw_key" | sed 's/base64://')
+            # Generate the application key using php artisan, keeping the base64: prefix
+            APP_KEY=$(sudo -u www-data php artisan key:generate --show)
 
-            # Set the new APP_KEY in the .env file
+            # Validate the generated APP_KEY (without base64: it should be 32 characters long)
+            decoded_key=$(echo "${APP_KEY#base64:}" | base64 --decode 2>/dev/null)
+            if [ ${#decoded_key} -ne 32 ]; then
+                error "Generated APP_KEY is invalid. Expected a base64-encoded 32-character key."
+                return 1
+            fi
+
+            # Set the new APP_KEY in the .env file, ensuring base64 prefix is retained
             sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "$FIREFLY_INSTALL_DIR/.env"
 
             # Capture the newly generated APP_KEY
@@ -2726,18 +2738,19 @@ EOF
     fi
 }
 
-# Function to print messages in a box with optional color and word wrapping
+# Function to print messages in a dynamically sized box with icons, colors, and word wrapping
 print_message_box() {
     local color="${1}"
     local message="${2}"
     local title="${3:-}"
+    local icon="${4:-}"
     local max_width=60 # Set a fixed width for wrapping content
 
     # Function to wrap text by word and limit the length of each line
     wrap_text() {
         local text="$1"
         local width="$2"
-        echo "$text" | fold -s -w "$width"
+        echo -e "$text" | fold -s -w "$width"
     }
 
     # Split message into lines and find max length
@@ -2749,23 +2762,30 @@ print_message_box() {
         [ ${#line} -gt $max_length ] && max_length=${#line}
     done
 
-    # Print double border if it's a title section
-    if [ -n "$title" ]; then
-        local title_length=${#title}
-        local padding=$(((max_length - title_length) / 2))
-        local title_border=$(printf '=%.0s' $(seq 1 $((max_length + 4))))
-        echo -e "${color}${title_border}"
-        printf "| %-${padding}s%s%-${padding}s |\n" "" "$title" ""
-        echo -e "${title_border}"
+    # If the title length is greater than max message length, adjust width
+    local title_length=$((${#icon} + ${#title}))
+    if [ $title_length -gt $max_length ]; then
+        max_length=$title_length
     fi
 
-    # Print the box with dynamic width based on max length of content
-    local border=$(printf '─%.0s' $(seq 1 $((max_length + 4))))
-    echo -e "${color}${border}"
+    # Adjust box width dynamically based on the longest line
+    local box_width=$((max_length + 4))
+
+    # Print top border with icon and title
+    if [ -n "$title" ]; then
+        printf "${color}┌%*s┐${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
+        printf "${color}│ %-${max_length}s │${COLOR_RESET}\n" "${icon} ${title}"
+        printf "${color}├%*s┤${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
+    fi
+
+    # Print message content
     for line in "${lines[@]}"; do
-        printf "| %-${max_length}s |\n" "$line"
+        printf "${color}│ %-${max_length}s │${COLOR_RESET}\n" "$line"
     done
-    echo -e "${border}${COLOR_RESET}"
+
+    # Print bottom border with proper ASCII characters
+    printf "${color}└%*s┘${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
+    echo -e "${COLOR_RESET}"
 }
 
 #####################################################################################################################################################
@@ -2814,13 +2834,13 @@ save_credentials
 
 # Use this function as below for cleaner output:
 final_message="Installation and Update Process Completed"
-print_message_box "${COLOR_GREEN}" "${final_message}" "PROCESS COMPLETE"
+print_message_box "${COLOR_GREEN}" "${final_message}" "PROCESS COMPLETE" "✔"
 
 access_message="Firefly III: http://${server_ip}:80\nFirefly Importer: http://${server_ip}:8080"
-print_message_box "${COLOR_CYAN}" "${access_message}" "ACCESS INFORMATION"
+print_message_box "${COLOR_CYAN}" "${access_message}" "ACCESS INFORMATION" "⚙"
 
 config_message="Configuration Files:\nFirefly III: ${FIREFLY_INSTALL_DIR}/.env\nFirefly Importer: ${IMPORTER_INSTALL_DIR}/.env\nCron Job: /etc/cron.d/firefly-iii-cron\nCredentials: /root/firefly_credentials.txt"
-print_message_box "${COLOR_YELLOW}" "${config_message}" "CONFIGURATION FILES"
+print_message_box "${COLOR_YELLOW}" "${config_message}" "CONFIGURATION FILES" "⚙"
 
 log_message="Log File: ${LOG_FILE}\nView Logs: cat ${LOG_FILE}\nLogs older than 7 days auto-deleted."
-print_message_box "${COLOR_BLUE}" "${log_message}" "LOG DETAILS"
+print_message_box "${COLOR_BLUE}" "${log_message}" "LOG DETAILS" "📄"
