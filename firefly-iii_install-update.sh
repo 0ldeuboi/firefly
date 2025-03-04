@@ -237,6 +237,8 @@ apt_install_with_progress() {
     local package_count=$(echo "$packages" | wc -w)
     local step=0
     
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Installing packages: $packages" >> "$LOG_FILE"
+    
     # Create an array from the package list
     local pkg_array=($packages)
     
@@ -244,7 +246,16 @@ apt_install_with_progress() {
     for pkg in "${pkg_array[@]}"; do
         step=$((step + 1))
         show_progress "$operation_name" "$step" "$package_count" "Installing $pkg" "true"
-        apt-get install -y "$pkg" >/dev/null 2>&1
+        
+        # Run apt-get but capture output to log
+        apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1
+        local exit_code=$?
+        
+        echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Installed $pkg with exit code $exit_code" >> "$LOG_FILE"
+        
+        if [ $exit_code -ne 0 ]; then
+            warning "Failed to install $pkg (exit code $exit_code). See log for details."
+        fi
     done
 }
 
@@ -256,13 +267,16 @@ composer_install_with_progress() {
     
     cd "$directory"
     
+    # Log start of composer install
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Starting composer install in $directory" >> "$LOG_FILE"
+    
     # We'll estimate progress based on time, since composer doesn't provide easy progress output
     local estimated_time=120  # seconds
     local start_time=$(date +%s)
     
-    # Start composer in background
+    # Start composer in background with output to both console log and log file
     PHP_DEPRECATION_WARNINGS=0 COMPOSER_DISABLE_XDEBUG_WARN=1 COMPOSER_MEMORY_LIMIT=-1 COMPOSER_ALLOW_SUPERUSER=1 \
-    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader > /tmp/composer.log 2>&1 &
+    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader > >(tee -a "$LOG_FILE" > /tmp/composer.log) 2> >(tee -a "$LOG_FILE" >&2) &
     local composer_pid=$!
     
     # While composer is running, update progress
@@ -286,9 +300,14 @@ composer_install_with_progress() {
     # Show 100% when complete
     show_progress "Composer Installation" 100 100 "Installation complete" "true"
     
+    # Log completion of composer install
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Finished composer install in $directory" >> "$LOG_FILE"
+    
     # Check if composer was successful
     wait $composer_pid
-    return $?
+    local exit_code=$?
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Composer exit code: $exit_code" >> "$LOG_FILE"
+    return $exit_code
 }
 
 # Function to monitor a command with progress updates
@@ -305,8 +324,11 @@ monitor_command_progress() {
     local temp_output=$(mktemp)
     local line_count=0
     
+    # Log the command being executed
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Executing: $cmd" >> "$LOG_FILE"
+    
     # Run command in background and monitor progress
-    eval "$cmd" > "$temp_output" 2>&1 &
+    eval "$cmd" > >(tee -a "$LOG_FILE" > "$temp_output") 2> >(tee -a "$LOG_FILE" >&2) &
     local cmd_pid=$!
     
     # Update progress while command runs
@@ -329,12 +351,17 @@ monitor_command_progress() {
     # Show 100% when complete
     show_progress "$operation_name" "$total_steps" "$total_steps" "Complete" "true"
     
+    # Log completion
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Completed: $cmd" >> "$LOG_FILE"
+    
     # Clean up
     rm -f "$temp_output"
     
     # Check if command was successful
     wait $cmd_pid
-    return $?
+    local exit_code=$?
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Exit code: $exit_code" >> "$LOG_FILE"
+    return $exit_code
 }
 
 # Ensure the script is run as root
