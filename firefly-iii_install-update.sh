@@ -1006,8 +1006,6 @@ find_compatible_php_version() {
     # Step 2: Get available PHP versions from the repository
     local php_versions=$(apt-cache search --names-only '^php[0-9.]+$' | cut -d' ' -f1 | sed 's/php//' | sort -V)
     
-    info "Available PHP versions: $php_versions"
-    
     # Step 3: Find a version that satisfies the requirement
     local compatible_version=""
     for version in $php_versions; do
