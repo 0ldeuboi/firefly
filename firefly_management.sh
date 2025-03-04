@@ -32,23 +32,22 @@ RESET="\033[0m"
 # Functions for colored output
 info() {
     TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')         # Current timestamp for logging
-    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*" # Always print info to console
+    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*" >&2 # Print info messages to stderr
     echo "$TIMESTAMP [INFO] $*" >>"$LOG_FILE"      # Log info to the log file
 }
 
 success() {
-    echo -e "${COLOR_GREEN}[SUCCESS]${COLOR_RESET} $*"
+    echo -e "${COLOR_GREEN}[SUCCESS]${COLOR_RESET} $*" >&2
 }
 
 warning() {
-    echo -e "${COLOR_YELLOW}[WARNING]${COLOR_RESET} $*"
+    echo -e "${COLOR_YELLOW}[WARNING]${COLOR_RESET} $*" >&2
 }
 
-# Function to handle errors
 error() {
     TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S') # Current timestamp for logging
     if [ "$NON_INTERACTIVE" = false ]; then
-        echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2 # Print error to console if interactive
+        echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2 # Print error to stderr
     fi
     echo "$TIMESTAMP [ERROR] $*" >>"$LOG_FILE" # Log error to the log file regardless
 }
@@ -473,6 +472,62 @@ display_menu() {
     return 0
 }
 
+# Function to add Ondrej's PHP repository and ensure it contains the required PHP version
+add_php_repository() {
+    local target_version="$1"
+    info "Adding and verifying Ondrej's PPA for PHP $target_version..."
+    
+    # Install required packages for adding repositories
+    apt-get update
+    apt-get install -y software-properties-common apt-transport-https lsb-release ca-certificates
+    
+    # Add the PPA if not already present
+    if ! grep -q "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
+        LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+    else
+        info "Ondrej's PHP repository already exists."
+    fi
+    
+    # Always update package list
+    apt-get update -y
+    
+    # Verify if target PHP version is available in repository
+    if apt-cache search --names-only "php$target_version" | grep -q "php$target_version"; then
+        success "Successfully verified PHP $target_version is available in repository."
+        return 0
+    else
+        warning "PHP $target_version packages not found in standard repository."
+        
+        # Try Direct repository configuration if the PPA approach fails
+        info "Adding repository configuration directly..."
+        
+        # Create a backup of the existing file if it exists
+        if [ -f /etc/apt/sources.list.d/ondrej-php.list ]; then
+            cp /etc/apt/sources.list.d/ondrej-php.list /etc/apt/sources.list.d/ondrej-php.list.bak
+        fi
+        
+        # Create the repository file
+        echo "deb http://ppa.launchpad.net/ondrej/php/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/ondrej-php.list
+        echo "deb-src http://ppa.launchpad.net/ondrej/php/ubuntu $(lsb_release -cs) main" >> /etc/apt/sources.list.d/ondrej-php.list
+        
+        # Add the key if missing
+        if ! apt-key list | grep -q "Ondřej Surý"; then
+            apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 4F4EA0AAE5267A6C
+        fi
+        
+        # Update and check again
+        apt-get update -y
+        
+        if apt-cache search --names-only "php$target_version" | grep -q "php$target_version"; then
+            success "Successfully added repository with PHP $target_version packages."
+            return 0
+        else
+            warning "PHP $target_version packages still not available after repository additions."
+            return 1
+        fi
+    fi
+}
+
 # Function to determine the latest available PHP version from apt repositories
 get_latest_php_version() {
     # Fetch the list of PHP versions available via apt-cache and filter valid PHP version formats
@@ -501,6 +556,308 @@ get_latest_php_version() {
     fi
 
     # Indicate successful completion
+    return 0
+}
+
+# Function to check PHP compatibility with Firefly III release
+check_php_compatibility() {
+    local release_tag="$1"
+    local current_php_version="$2"
+    
+    info "Checking PHP compatibility for Firefly III $release_tag..."
+    
+    # Get the composer.json from the release to check PHP requirements
+    local composer_json_url="https://raw.githubusercontent.com/firefly-iii/firefly-iii/$release_tag/composer.json"
+    local composer_json=$(curl -s "$composer_json_url")
+    
+    if [ -z "$composer_json" ]; then
+        warning "Could not fetch composer.json for version check. Proceeding with caution."
+        return 0
+    fi
+    
+    # Extract PHP requirement from composer.json
+    local php_req=$(echo "$composer_json" | grep -o '"php": *"[^"]*"' | sed 's/"php": *"\([^"]*\)"/\1/')
+    
+    if [ -z "$php_req" ]; then
+        warning "Could not determine PHP requirement. Proceeding with caution."
+        return 0
+    fi
+    
+    info "Firefly III $release_tag requires PHP $php_req"
+    info "Current PHP version: $current_php_version"
+    
+    # Parse the required PHP version
+    local min_php_version=$(echo "$php_req" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+    if [ -z "$min_php_version" ]; then
+        min_php_version=$(echo "$php_req" | grep -o '[0-9]\+\.[0-9]\+' | head -1)
+        if [ -z "$min_php_version" ]; then
+            warning "Could not parse PHP version requirement: $php_req. Proceeding with caution."
+            return 0
+        fi
+        min_php_version="${min_php_version}.0"
+    fi
+    
+    # Compare versions
+    if ! compare_versions "$current_php_version" ">=" "$min_php_version"; then
+        warning "PHP version $current_php_version is not compatible with Firefly III $release_tag (requires $min_php_version)."
+        
+        # Get the major and minor parts of the required version
+        local req_major=$(echo "$min_php_version" | cut -d. -f1)
+        local req_minor=$(echo "$min_php_version" | cut -d. -f2)
+        
+        # Check if a compatible PHP version is available
+        local compatible_php_version=$(find_compatible_php_version "$min_php_version" | tail -n1 | xargs)
+        info "Compatible PHP version found: '$compatible_php_version'"
+        
+        # Inside check_php_compatibility where you ask the user about installing PHP
+        if [ -n "$compatible_php_version" ]; then
+            if [ "$NON_INTERACTIVE" = true ]; then
+                info "Non-interactive mode: Automatically upgrading to PHP $compatible_php_version"
+                if ! install_php_version "$compatible_php_version"; then
+                    error "Failed to install PHP $compatible_php_version"
+                    return 1
+                fi
+                return 0
+            else
+                prompt "Would you like to install PHP $compatible_php_version? (y/N): "
+                read UPGRADE_PHP_INPUT
+                if [[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]]; then
+                    if ! install_php_version "$compatible_php_version"; then
+                        error "Failed to install PHP $compatible_php_version"
+                        return 1
+                    fi
+                    return 0
+                else
+                    error "PHP version incompatible with Firefly III $release_tag. Upgrade canceled."
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    
+    info "PHP version $current_php_version is compatible with Firefly III $release_tag."
+    return 0
+}
+
+# Function to compare version strings
+compare_versions() {
+    local version1="$1"
+    local operator="$2"
+    local version2="$3"
+    
+    # Normalize versions to have the same number of segments
+    local v1_parts=() v2_parts=()
+    IFS="." read -ra v1_parts <<< "$version1"
+    IFS="." read -ra v2_parts <<< "$version2"
+    
+    # Pad with zeros if needed
+    while [ ${#v1_parts[@]} -lt 3 ]; do
+        v1_parts+=("0")
+    done
+    while [ ${#v2_parts[@]} -lt 3 ]; do
+        v2_parts+=("0")
+    done
+    
+    local v1_major="${v1_parts[0]}" v1_minor="${v1_parts[1]}" v1_patch="${v1_parts[2]}"
+    local v2_major="${v2_parts[0]}" v2_minor="${v2_parts[1]}" v2_patch="${v2_parts[2]}"
+    
+    # Calculate version as a number for comparison
+    local v1=$((v1_major * 10000 + v1_minor * 100 + v1_patch))
+    local v2=$((v2_major * 10000 + v2_minor * 100 + v2_patch))
+    
+    case "$operator" in
+        ">=") return $((v1 >= v2 ? 0 : 1)) ;;
+        ">")  return $((v1 > v2 ? 0 : 1)) ;;
+        "<=") return $((v1 <= v2 ? 0 : 1)) ;;
+        "<")  return $((v1 < v2 ? 0 : 1)) ;;
+        "=")  return $((v1 == v2 ? 0 : 1)) ;;
+        *)    error "Unknown operator: $operator"; return 2 ;;
+    esac
+}
+
+# Function to find a compatible PHP version from the repository
+find_compatible_php_version() {
+    local min_version="$1"
+    local major_version="${min_version%%.*}"
+    local minor_version=$(echo "$min_version" | cut -d. -f2)
+    
+    info "Searching for PHP versions that satisfy >= $min_version..."
+    
+    # Try to add the repository for the target version
+    add_php_repository "$major_version.$minor_version"
+    
+    # Get available PHP versions from the repository - keeping it simple
+    local php_versions=$(apt-cache search --names-only '^php[0-9.]+$' | cut -d' ' -f1 | sed 's/php//' | sort -V)
+    
+    info "Available PHP versions: $php_versions"
+    
+    # Find a version that satisfies the requirement
+    local compatible_version=""
+    for version in $php_versions; do
+        # For direct comparison
+        if [ "$version" = "$major_version.$minor_version" ]; then
+            compatible_version="$version"
+            break
+        fi
+    done
+    
+    # If exact match not found, find any compatible version
+    if [ -z "$compatible_version" ]; then
+        for version in $php_versions; do
+            if compare_versions "$version.0" ">=" "$min_version"; then
+                compatible_version="$version"
+                break
+            fi
+        done
+    fi
+    
+    # Return just the version number, nothing else
+    echo "$compatible_version"
+}
+
+# Function to install a specific PHP version
+install_php_version() {
+    local php_version="$1"
+    
+    info "Installing PHP $php_version and required extensions..."
+    
+    # Install the PHP version and extensions one by one to avoid regex errors
+    apt-get install -y php$php_version || {
+        error "Failed to install PHP $php_version base package."
+        return 1
+    }
+    
+    # Install extensions one by one
+    local extensions=("bcmath" "intl" "curl" "zip" "gd" "xml" "mbstring" "mysql" "sqlite3")
+    for ext in "${extensions[@]}"; do
+        apt-get install -y php$php_version-$ext || warning "Failed to install php$php_version-$ext, continuing..."
+    done
+    
+    # Install Apache module
+    apt-get install -y libapache2-mod-php$php_version || {
+        warning "Failed to install libapache2-mod-php$php_version. Will try to continue."
+    }
+    
+    # Enable the new PHP version
+    info "Enabling PHP $php_version in Apache..."
+    a2dismod php* 2>/dev/null || true
+    a2enmod php$php_version || {
+        error "Failed to enable PHP $php_version in Apache."
+        return 1
+    }
+    
+    # Restart Apache to apply the new PHP configuration
+    info "Restarting Apache to apply new PHP configuration..."
+    systemctl restart apache2 || {
+        error "Failed to restart Apache after PHP installation."
+        return 1
+    }
+    
+    # Verify the installation
+    if php -v | grep -q "PHP $php_version"; then
+        success "Successfully installed and configured PHP $php_version."
+        return 0
+    else
+        error "Failed to activate PHP $php_version. Current version is $(php -v | head -n1)."
+        return 1
+    fi
+}
+
+# Function to find a Firefly III version compatible with current PHP
+find_compatible_firefly_release() {
+    local current_php_version="$1"
+    local max_releases=10
+    
+    info "Searching for Firefly III releases compatible with PHP $current_php_version..."
+    
+    # Get the list of releases from GitHub API
+    local releases_json=$(curl -s "https://api.github.com/repos/firefly-iii/firefly-iii/releases" | head -n 5000)
+    
+    # Check if we got a valid response
+    if ! echo "$releases_json" | grep -q "tag_name"; then
+        error "Failed to fetch Firefly III releases from GitHub API."
+        return 1
+    fi
+    
+    # Extract tags and process them
+    local tags=$(echo "$releases_json" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+    local checked=0
+    
+    for tag in $tags; do
+        # Limit the number of releases to check
+        if [ $checked -ge $max_releases ]; then
+            break
+        fi
+        checked=$((checked + 1))
+        
+        info "Checking compatibility of Firefly III $tag..."
+        
+        # Get composer.json for this release
+        local composer_url="https://raw.githubusercontent.com/firefly-iii/firefly-iii/$tag/composer.json"
+        local composer_json=$(curl -s "$composer_url")
+        
+        # Extract PHP requirement
+        local php_req=$(echo "$composer_json" | grep -o '"php": *"[^"]*"' | sed 's/"php": *"\([^"]*\)"/\1/')
+        
+        if [ -z "$php_req" ]; then
+            warning "Could not determine PHP requirement for $tag. Skipping."
+            continue
+        fi
+        
+        # Parse min PHP version
+        local min_php_version=$(echo "$php_req" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+        if [ -z "$min_php_version" ]; then
+            min_php_version=$(echo "$php_req" | grep -o '[0-9]\+\.[0-9]\+' | head -1)
+            if [ -z "$min_php_version" ]; then
+                warning "Could not parse PHP version requirement for $tag: $php_req. Skipping."
+                continue
+            fi
+            min_php_version="${min_php_version}.0"
+        fi
+        
+        # Compare with current PHP version
+        if compare_versions "$current_php_version" ">=" "$min_php_version"; then
+            success "Found compatible release: Firefly III $tag (requires PHP $min_php_version)"
+            echo "$tag"
+            return 0
+        else
+            info "Firefly III $tag requires PHP $min_php_version, not compatible with current PHP $current_php_version."
+        fi
+    done
+    
+    warning "Could not find a compatible Firefly III release after checking $checked releases."
+    return 1
+}
+
+# Function to download a specific release with progress bar
+download_specific_release() {
+    local repo="$1"
+    local dest_dir="$2"
+    local tag="$3"
+    
+    info "Downloading $repo $tag..."
+    
+    # Construct the download URL for the specific release
+    local download_url="https://github.com/$repo/releases/download/$tag/$(echo $repo | cut -d'/' -f2)-$tag.zip"
+    local release_filename="$(echo $repo | cut -d'/' -f2)-$tag.zip"
+    
+    # Download the release with a progress bar
+    info "Downloading from $download_url..."
+    if ! wget --progress=bar:force:noscroll --tries=3 --timeout=30 -O "$dest_dir/$release_filename" "$download_url" 2>&1 | stdbuf -o0 awk '{if(NR>1)print "\r\033[K" $0, "\r"}'; then
+        warning "wget failed, falling back to curl."
+        if ! curl -L --retry 3 --max-time 30 -o "$dest_dir/$release_filename" --progress-bar "$download_url"; then
+            error "Failed to download $repo $tag."
+            return 1
+        fi
+    fi
+    
+    # Validate download (check if the zip file is valid)
+    if ! unzip -t "$dest_dir/$release_filename" > /dev/null 2>&1; then
+        error "The downloaded file is not a valid zip archive."
+        return 1
+    fi
+    
+    success "Successfully downloaded $repo $tag."
     return 0
 }
 
@@ -546,6 +903,36 @@ fetch_release_info() {
     return 0
 }
 
+# Function to get the latest Firefly III version from the JSON file
+get_latest_firefly_version() {
+    local json
+    json=$(curl -s "https://version.firefly-iii.org/index.json")
+    if [ -z "$json" ]; then
+        error "Failed to retrieve latest Firefly III version information."
+        return 1
+    fi
+    # Extract the version from the 'firefly_iii' section, removing the leading 'v'
+    local latest_version
+    latest_version=$(echo "$json" | jq -r '.firefly_iii.stable.version' | sed 's/^v//')
+    echo "$latest_version"
+    return 0
+}
+
+# Function to get the latest Firefly Importer version from the JSON file
+get_latest_importer_version() {
+    local json
+    json=$(curl -s "https://version.firefly-iii.org/index.json")
+    if [ -z "$json" ]; then
+        error "Failed to retrieve latest Firefly Importer version information."
+        return 1
+    fi
+    # Extract the version from the 'data' section, removing the leading 'v'
+    local latest_importer_version
+    latest_importer_version=$(echo "$json" | jq -r '.data.stable.version' | sed 's/^v//')
+    echo "$latest_importer_version"
+    return 0
+}
+
 # Function to get the latest release download URL from GitHub using jq
 get_latest_release_url() {
     local repo="$1"
@@ -553,19 +940,104 @@ get_latest_release_url() {
     local release_info
     release_info=$(curl -s "https://api.github.com/repos/$repo/releases/latest")
 
+    # Check if the API response contains valid data
+    if [ -z "$release_info" ] || [ "$release_info" = "null" ]; then
+        error "Failed to retrieve release information from GitHub."
+        return 1
+    fi
+
     # Check if the rate limit has been exceeded
     if echo "$release_info" | grep -q "API rate limit exceeded"; then
         error "GitHub API rate limit exceeded. Please try again later or use a GitHub API token."
         return 1
     fi
 
-    echo "$release_info" | jq -r --arg file_pattern "$file_pattern" '.assets[] | select(.name | test($file_pattern)) | .browser_download_url' | head -n1
+    # Extract and filter download URLs using jq, with an additional safeguard against missing assets
+    echo "$release_info" | jq -r --arg file_pattern "$file_pattern" '
+        if .assets then 
+            .assets[] | select(.name | test($file_pattern)) | .browser_download_url 
+        else 
+            empty 
+        end' | head -n1
 
-    # Indicate successful completion
     return 0
 }
 
-# Function to download and validate a release
+# Check and display Firefly III version
+check_firefly_version() {
+    local firefly_path="/var/www/firefly-iii"
+
+    if [ ! -d "$firefly_path" ]; then
+        echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} Firefly III directory not found at $firefly_path"
+        return 1
+    fi
+
+    info "Checking Firefly III version..."
+
+    if cd "$firefly_path"; then
+        local version
+        version=$(php artisan firefly-iii:output-version 2>/dev/null)
+    else
+        echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} Could not access $firefly_path"
+        return 1
+    fi
+
+    version=$(echo "$version" | tr -d '\n') # Trim newlines
+    info "Firefly III Version (artisan): $version"
+
+    echo "$version"  # ✅ This ensures the function "returns" the version when called
+    return 0
+}
+
+# Function to get the installed Firefly Importer version
+get_importer_version() {
+    local importer_path="/var/www/data-importer"
+    local version
+
+    # Ensure the correct directory is used
+    if [ ! -d "$importer_path" ]; then
+        echo "Error: Firefly Importer directory not found at $importer_path." >&2
+        return 1
+    fi
+
+    # Retrieve the version using artisan
+    version=$(php "$importer_path/artisan" config:show importer.version 2>/dev/null | awk '{print $NF}')
+
+    if [[ -n "$version" ]]; then
+        echo "$version"
+    else
+        echo "Error: Could not retrieve importer version." >&2
+        return 1
+    fi
+}
+
+# Function to check the installed Firefly Importer version
+check_firefly_importer_version() {
+    local firefly_importer_path="/var/www/data-importer"
+
+    if [ ! -d "$firefly_importer_path" ]; then
+        error "Firefly Importer directory not found at $firefly_importer_path."
+        return 1
+    fi
+
+    info "Checking Firefly Importer version..."
+
+    local importer_version
+    importer_version=$(get_importer_version)
+    importer_version=$(echo "$importer_version" | tr -d '\n')
+
+    if [[ -z "$importer_version" ]]; then
+        error "Could not determine Firefly Importer version."
+        return 1
+    fi
+
+    success "Firefly Importer Version: $importer_version"
+    
+    echo "$importer_version"  # ✅ This ensures the function "returns" the version
+    return 0
+}
+
+# Function to download and validate a release with a cleaner progress display
 download_and_validate_release() {
     local repo="$1"
     local dest_dir="$2"
@@ -614,12 +1086,13 @@ download_and_validate_release() {
         sha256_url="${release_url}.sha256"
     fi
 
-    # Download the release file using wget, fall back to curl if wget fails, with detailed logging
-    info "Attempting to download release from $release_url using wget..."
-    if ! wget --tries=3 --timeout=30 --content-disposition -P "$dest_dir" "$release_url" 2>&1 | tee -a "$LOG_FILE"; then
-        warning "wget failed, falling back to curl. Attempting to download $release_filename using curl..."
-        if ! curl -L --retry 3 --max-time 30 -o "$dest_dir/$release_filename" "$release_url" 2>&1 | tee -a "$LOG_FILE"; then
-            error "Failed to download the release file from $release_url after retries. See log for details."
+    # Download the release file using wget with a single line progress bar
+    info "Downloading $release_filename from $repo..."
+    if ! wget --progress=bar:force:noscroll --tries=3 --timeout=30 --content-disposition -P "$dest_dir" "$release_url" 2>&1 | stdbuf -o0 awk '{if(NR>1)print "\r\033[K" $0, "\r"}'; then
+        warning "wget failed, falling back to curl."
+        # Use curl with a progress bar
+        if ! curl -L --retry 3 --max-time 30 -o "$dest_dir/$release_filename" --progress-bar "$release_url"; then
+            error "Failed to download the release file from $release_url after retries."
             return 1
         fi
         success "Downloaded $release_filename using curl."
@@ -631,11 +1104,11 @@ download_and_validate_release() {
     if [ -z "$sha256_url" ]; then
         warning "No SHA256 checksum found for $repo. Skipping checksum validation. Proceeding without checksum verification may pose security risks."
     else
-        # Download the sha256 checksum file
+        # Download the sha256 checksum file (without verbose output)
         info "Downloading SHA256 checksum from $sha256_url..."
-        if ! wget --tries=3 --timeout=30 --content-disposition -P "$dest_dir" "$sha256_url"; then
+        if ! wget -q --tries=3 --timeout=30 --content-disposition -P "$dest_dir" "$sha256_url"; then
             warning "wget failed for sha256, falling back to curl."
-            if ! curl -L --retry 3 --max-time 30 -o "$dest_dir/$sha256_filename" "$sha256_url"; then
+            if ! curl -s -L --retry 3 --max-time 30 -o "$dest_dir/$sha256_filename" "$sha256_url"; then
                 error "Failed to download the SHA256 checksum file from $sha256_url after retries."
                 return 1
             fi
@@ -652,7 +1125,7 @@ download_and_validate_release() {
         fi
 
         info "Validating the downloaded archive file..."
-        if ! (cd "$dest_dir" && sha256sum -c "$(basename "$sha256_file")"); then
+        if ! (cd "$dest_dir" && sha256sum -c "$(basename "$sha256_file")" 2>/dev/null); then
             error "SHA256 checksum validation failed for $archive_file."
             return 1
         fi
@@ -1132,7 +1605,6 @@ install_firefly() {
     check_certbot_auto_renewal
 
     # Install Composer
-    info "Installing Composer..."
     EXPECTED_SIGNATURE=$(curl -s https://composer.github.io/installer.sig)
     php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
     ACTUAL_SIGNATURE=$(php -r "echo hash_file('sha384', 'composer-setup.php');")
@@ -1154,9 +1626,20 @@ install_firefly() {
     extract_archive "$archive_file" "$FIREFLY_INSTALL_DIR" || return 1
 
     # Run composer install if vendor directory is missing
+    info "Ensuring Composer cache directory exists..."
+    sudo mkdir -p /var/www/.cache/composer/files/
+    sudo chown -R www-data:www-data /var/www/.cache/composer
+    sudo chmod -R 775 /var/www/.cache/composer
+
+    info "Clearing Composer cache..."
+    sudo -u www-data composer clear-cache
+
+    # Run composer install if vendor directory is missing
     if [ ! -d "$FIREFLY_INSTALL_DIR/vendor" ]; then
         info "Running composer install for Firefly III..."
-        sudo -u www-data composer install --no-dev --prefer-dist --working-dir="$FIREFLY_INSTALL_DIR"
+        PHP_DEPRECATION_WARNINGS=0 COMPOSER_DISABLE_XDEBUG_WARN=1 COMPOSER_MEMORY_LIMIT=-1 COMPOSER_ALLOW_SUPERUSER=1 sudo -u www-data composer install --no-dev --prefer-dist --working-dir="$FIREFLY_INSTALL_DIR" --no-interaction --optimize-autoloader
+    else
+        info "Vendor directory exists. Skipping composer install."
     fi
 
     # Set permissions for Firefly III
@@ -1492,11 +1975,24 @@ install_firefly_importer() {
     php composer-setup.php --install-dir=/usr/local/bin --filename=composer
     rm composer-setup.php
 
+    info "Ensuring Composer cache directories exist..."
+    sudo mkdir -p /var/www/.cache/composer/files/
+    sudo chown -R www-data:www-data /var/www/.cache/composer
+    sudo chmod -R 775 /var/www/.cache/composer
+
+    info "Clearing Composer cache..."
+    sudo -u www-data composer clear-cache
+
     info "Installing Composer dependencies for Firefly Importer..."
-    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader || {
-        error "Composer install failed for Firefly Importer. Please check the error messages above."
-        return 1
-    }
+    if [ ! -d "$FIREFLY_IMPORTER_DIR/vendor" ]; then
+        info "No vendor directory found. Running composer install..."
+        PHP_DEPRECATION_WARNINGS=0 COMPOSER_DISABLE_XDEBUG_WARN=1 COMPOSER_MEMORY_LIMIT=-1 COMPOSER_ALLOW_SUPERUSER=1 sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader || {
+            error "Composer install failed for Firefly Importer. Please check the error messages above."
+            return 1
+        }
+    else
+        info "Vendor directory exists. Skipping composer install."
+    fi
 
     # Generate application key with --force
     info "Generating application key for Firefly Importer..."
@@ -1802,6 +2298,9 @@ EOF
         exit 0
     fi
 
+    # Capture installed version
+    installed_importer_version=$(check_firefly_importer_version)
+
     # Indicate successful completion
     return 0
 }
@@ -1923,7 +2422,7 @@ save_credentials() {
     return 0
 }
 
-# Function to update Firefly III
+# Modified update_firefly function with version compatibility handling
 update_firefly() {
     info "An existing Firefly III installation was detected."
 
@@ -1946,167 +2445,53 @@ update_firefly() {
         info "Updating package lists..."
         apt update
 
-        # Detect the latest available stable PHP version
-        LATEST_PHP_VERSION=$(get_latest_php_version)
-        info "Latest available stable PHP version is: $LATEST_PHP_VERSION"
-
-        # Check if PHP is already installed
+        # Detect the current PHP version
         if command -v php &>/dev/null; then
-            # PHP is installed, detect the current version
-            CURRENT_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+            CURRENT_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION.'.'.PHP_RELEASE_VERSION;")
             info "PHP is currently installed with version: $CURRENT_PHP_VERSION"
-
-            # Determine if an upgrade is needed based on version comparison
-            if [ "$(printf '%s\n' "$LATEST_PHP_VERSION" "$CURRENT_PHP_VERSION" | sort -V | head -n1)" != "$LATEST_PHP_VERSION" ]; then
-                UPGRADE_NEEDED=true
-            else
-                UPGRADE_NEEDED=false
-            fi
-
-            if [ "$NON_INTERACTIVE" = true ]; then
-                UPGRADE_PHP=${UPGRADE_NEEDED}
-            else
-                if [ "$UPGRADE_NEEDED" = true ]; then
-                    prompt "A newer stable PHP version ($LATEST_PHP_VERSION) is available. Do you want to upgrade? (Y/n): "
-                    read UPGRADE_PHP_INPUT
-                    UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-Y}
-                    UPGRADE_PHP=$([[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]] && echo true || echo false)
-                else
-                    UPGRADE_PHP=false
-                    info "PHP is up to date."
-                fi
-            fi
-
-            if [ "$UPGRADE_PHP" = true ]; then
-                info "Upgrading to PHP $LATEST_PHP_VERSION..."
-
-                # Install the latest stable PHP version and required extensions
-                apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
-                    php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
-                    php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
-                    php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
-
-                # Handle retaining or disabling older PHP versions
-                if [ "$NON_INTERACTIVE" = true ]; then
-                    RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
-                else
-                    prompt "Do you want to retain older PHP versions? (y/N): "
-                    read RETAIN_OLD_PHP
-                    RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
-                fi
-
-                if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
-                    info "Retaining all older PHP versions. This might increase disk usage and may cause conflicts if other applications depend on older PHP versions."
-                else
-                    warning "Disabling older PHP versions may affect other applications that use these versions. Ensure that other applications are compatible with the new PHP version before proceeding."
-
-                    # Proceed with disabling old PHP versions
-                    for version in $(ls /etc/apache2/mods-enabled/php*.load | grep -oP 'php\K[\d.]+(?=.load)' | grep -v "$LATEST_PHP_VERSION"); do
-                        # Backup the current PHP configuration before disabling it
-                        PHP_CONF="/etc/apache2/mods-available/php${version}.conf"
-                        if [ -f "$PHP_CONF" ]; then
-                            cp "$PHP_CONF" "${PHP_CONF}.bak"
-                            info "Backed up $PHP_CONF to ${PHP_CONF}.bak"
-                        fi
-                        a2dismod "php${version}"
-                        info "Disabled PHP $version"
-                    done
-                    success "Older PHP versions have been disabled."
-                fi
-
-                # Enable the latest PHP version
-                info "Enabling PHP $LATEST_PHP_VERSION..."
-                a2enmod php"$LATEST_PHP_VERSION"
-
-                # Restart Apache to apply the new PHP configuration
-                info "Restarting Apache web server to apply PHP configuration..."
-                apachectl configtest || {
-                    error "Apache configuration test failed. Please check the configuration."
-                    return 1
-                }
-
-                if ! systemctl restart apache2; then
-                    error "Failed to restart Apache. Please check the Apache error logs for more details."
-                    return 1
-                fi
-
-                success "Apache successfully reloaded or started."
-            else
-                info "Skipping PHP upgrade. Using installed version: $CURRENT_PHP_VERSION"
-                LATEST_PHP_VERSION=$CURRENT_PHP_VERSION
-            fi
         else
-            # PHP is not installed, proceed to install the latest stable version
-            info "PHP is not currently installed. Installing PHP $LATEST_PHP_VERSION..."
-            if [ "$NON_INTERACTIVE" = true ]; then
-                INSTALL_PHP="Y" # Automatically install the latest PHP in non-interactive mode
-            else
-                prompt "PHP $LATEST_PHP_VERSION is the latest available. Do you want to install this version? (Y/n): "
-                read INSTALL_PHP
-                INSTALL_PHP=${INSTALL_PHP:-Y}
-            fi
-
-            if [[ "$INSTALL_PHP" =~ ^[Nn]$ ]]; then
-                prompt "Enter the PHP version you want to install (available: $LATEST_PHP_VERSION): "
-                read PHP_VERSION
-                PHP_VERSION=${PHP_VERSION:-$LATEST_PHP_VERSION}
-                LATEST_PHP_VERSION=$PHP_VERSION
-            fi
-
-            info "Installing PHP $LATEST_PHP_VERSION..."
-
-            # Install the latest stable PHP version and required extensions
-            apt install -y php$LATEST_PHP_VERSION php$LATEST_PHP_VERSION-bcmath php$LATEST_PHP_VERSION-intl \
-                php$LATEST_PHP_VERSION-curl php$LATEST_PHP_VERSION-zip php$LATEST_PHP_VERSION-gd \
-                php$LATEST_PHP_VERSION-xml php$LATEST_PHP_VERSION-mbstring php$LATEST_PHP_VERSION-mysql \
-                php$LATEST_PHP_VERSION-sqlite3 libapache2-mod-php$LATEST_PHP_VERSION
-
-            # Enable the latest PHP version
-            info "Enabling PHP $LATEST_PHP_VERSION..."
-            a2enmod php"$LATEST_PHP_VERSION"
-
-            # Restart Apache to apply the new PHP configuration
-            info "Restarting Apache web server to apply PHP configuration..."
-            apachectl configtest || {
-                error "Apache configuration test failed. Please check the configuration."
-                return 1
-            }
-
-            if ! systemctl restart apache2; then
-                error "Failed to restart Apache. Please check the Apache error logs for more details."
-                return 1
-            fi
-
-            success "Apache successfully reloaded or started."
+            error "PHP is not installed. Please install PHP before updating Firefly III."
+            return 1
         fi
 
-        # Remove any installed RC versions of PHP dynamically
-        info "Checking for any installed RC versions of PHP..."
-        RC_PHP_PACKAGES=$(dpkg -l | awk '/^ii/{print $2}' | grep -E '^php[0-9\.]+(-|$)' | while read -r pkg; do
-            # Get the package version
-            pkg_version=$(dpkg -s "$pkg" | awk '/Version:/{print $2}')
-            # Check if the version contains 'RC', 'alpha', or 'beta'
-            if [[ "$pkg_version" =~ (alpha|beta|RC) ]]; then
-                echo "$pkg"
-            fi
-        done)
-
-        if [ -n "$RC_PHP_PACKAGES" ]; then
-            info "Found installed PHP RC versions: $RC_PHP_PACKAGES"
-            apt purge -y $RC_PHP_PACKAGES
-            info "Purged PHP RC versions."
-        else
-            info "No PHP RC versions installed."
+        # Get the latest release tag for Firefly III
+        LATEST_TAG=$(curl -s https://api.github.com/repos/firefly-iii/firefly-iii/releases/latest | grep "tag_name" | cut -d '"' -f 4)
+        
+        if [ -z "$LATEST_TAG" ]; then
+            error "Failed to determine the latest Firefly III release. Please check your internet connection."
+            return 1
         fi
-
-        # Create a backup of the current installation
-        create_backup "$FIREFLY_INSTALL_DIR"
-
-        # Download and validate the latest release
-        download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || return 1
+        
+        info "Latest Firefly III release is $LATEST_TAG"
+        
+        # Check PHP compatibility before proceeding
+        if ! check_php_compatibility "$LATEST_TAG" "$CURRENT_PHP_VERSION"; then
+            # If a compatible Firefly III version was found, use it
+            if [ -n "$FIREFLY_RELEASE_TAG" ]; then
+                info "Using compatible Firefly III version $FIREFLY_RELEASE_TAG with current PHP $CURRENT_PHP_VERSION"
+                
+                # Use the specific release instead of the latest
+                # Replace the download_and_validate_release function call with:
+                local download_url="https://github.com/firefly-iii/firefly-iii/releases/download/$FIREFLY_RELEASE_TAG/FireflyIII-$FIREFLY_RELEASE_TAG.zip"
+                info "Downloading Firefly III $FIREFLY_RELEASE_TAG..."
+                
+                if ! wget --progress=bar:force:noscroll --tries=3 --timeout=30 -O "$FIREFLY_TEMP_DIR/FireflyIII-$FIREFLY_RELEASE_TAG.zip" "$download_url" 2>&1 | stdbuf -o0 awk '{if(NR>1)print "\r\033[K" $0, "\r"}'; then
+                    error "Failed to download Firefly III $FIREFLY_RELEASE_TAG"
+                    return 1
+                fi
+                
+                archive_file="$FIREFLY_TEMP_DIR/FireflyIII-$FIREFLY_RELEASE_TAG.zip"
+            else
+                error "PHP compatibility check failed. Cannot proceed with the update."
+                return 1
+            fi
+        else
+            # Original download code for latest version
+            download_and_validate_release "firefly-iii/firefly-iii" "$FIREFLY_TEMP_DIR" "\\.zip$" || return 1
+            archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
+        fi
 
         # Extract the archive file
-        archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
         extract_archive "$archive_file" "$FIREFLY_TEMP_DIR" || return 1
 
         # Copy over the .env file
@@ -2195,18 +2580,81 @@ update_firefly() {
             export APP_KEY=$(grep '^APP_KEY=' "$FIREFLY_INSTALL_DIR/.env" | cut -d '=' -f2)
         fi
 
+        # Run composer install to update dependencies
+        info "Ensuring Composer cache directory exists..."
+        sudo mkdir -p /var/www/.cache/composer/files/
+        sudo chown -R www-data:www-data /var/www/.cache/composer
+        sudo chmod -R 775 /var/www/.cache/composer
+
+        info "Clearing Composer cache..."
+        sudo -u www-data composer clear-cache
+
+        info "Running composer install to update dependencies..."
+        if ! PHP_DEPRECATION_WARNINGS=0 COMPOSER_DISABLE_XDEBUG_WARN=1 COMPOSER_MEMORY_LIMIT=-1 COMPOSER_ALLOW_SUPERUSER=1 sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader; then
+            error "Composer install failed. This might indicate a PHP version compatibility issue."
+
+            # Restore the old installation
+            info "Restoring the previous installation..."
+            rm -rf "$FIREFLY_INSTALL_DIR"
+            mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+
+            error "Update failed. The previous installation has been restored."
+            return 1
+        fi
+
         # Check if migrations have already been run
         info "Checking if database migrations have already been applied..."
         if sudo -u www-data php artisan migrate:status &>/dev/null; then
             info "Migrations have already been applied. Proceeding to migrate any new changes."
             if ! sudo -u www-data php artisan migrate --force; then
                 error "Failed to migrate database with php artisan. Please check your configuration."
+                
+                # Offer to restore from backup
+                if [ "$NON_INTERACTIVE" = false ]; then
+                    prompt "Database migration failed. Would you like to restore from backup? (Y/n): "
+                    read RESTORE_BACKUP
+                    RESTORE_BACKUP=${RESTORE_BACKUP:-Y}
+                    
+                    if [[ "$RESTORE_BACKUP" =~ ^[Yy]$ ]]; then
+                        info "Restoring from backup..."
+                        rm -rf "$FIREFLY_INSTALL_DIR"
+                        mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+                        success "Restored previous installation."
+                    fi
+                else
+                    info "Non-interactive mode: Automatically restoring from backup..."
+                    rm -rf "$FIREFLY_INSTALL_DIR"
+                    mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+                    success "Restored previous installation."
+                fi
+                
                 return 1
-            fi
+
+                fi
         else
             info "No migrations found. Proceeding with database migration."
             if ! sudo -u www-data php artisan migrate --force; then
                 error "Failed to migrate database with php artisan. Please check your configuration."
+                
+                # Offer to restore from backup
+                if [ "$NON_INTERACTIVE" = false ]; then
+                    prompt "Database migration failed. Would you like to restore from backup? (Y/n): "
+                    read RESTORE_BACKUP
+                    RESTORE_BACKUP=${RESTORE_BACKUP:-Y}
+                    
+                    if [[ "$RESTORE_BACKUP" =~ ^[Yy]$ ]]; then
+                        info "Restoring from backup..."
+                        rm -rf "$FIREFLY_INSTALL_DIR"
+                        mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+                        success "Restored previous installation."
+                    fi
+                else
+                    info "Non-interactive mode: Automatically restoring from backup..."
+                    rm -rf "$FIREFLY_INSTALL_DIR"
+                    mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+                    success "Restored previous installation."
+                fi
+                
                 return 1
             fi
         fi
@@ -2385,6 +2833,9 @@ EOF
         info "Update canceled by the user."
         exit 0
     fi
+
+    # Capture installed version
+    installed_version=$(check_firefly_version)
 
     # Indicate successful completion
     return 0
@@ -2743,48 +3194,88 @@ print_message_box() {
     local color="${1}"
     local message="${2}"
     local title="${3:-}"
-    local icon="${4:-}"
-    local max_width=60 # Set a fixed width for wrapping content
+    local max_width=60  # Maximum width for word wrapping
 
-    # Function to wrap text by word and limit the length of each line
+    # Function to wrap text by word and limit each line's length.
     wrap_text() {
         local text="$1"
         local width="$2"
         echo -e "$text" | fold -s -w "$width"
     }
 
-    # Split message into lines and find max length
-    local wrapped_message=$(wrap_text "$message" $max_width)
-    local IFS=$'\n'
-    local lines=($wrapped_message)
+    # Function to repeat a character n times.
+    repeat_char() {
+        local char="$1"
+        local count="$2"
+        for ((i=0; i<count; i++)); do
+            printf "%s" "$char"
+        done
+    }
+
+    # Get the length of a string (number of characters).
+    display_length() {
+        local input="$1"
+        echo "${#input}"
+    }
+
+    # Wrap the message text and split it into lines.
+    local wrapped_message
+    wrapped_message=$(wrap_text "$message" "$max_width")
+    IFS=$'\n' read -r -d '' -a lines <<< "$wrapped_message"$'\0'
+
+    # Determine the maximum display width from message lines.
     local max_length=0
+    local dlen
     for line in "${lines[@]}"; do
-        [ ${#line} -gt $max_length ] && max_length=${#line}
+        dlen=$(display_length "$line")
+        if (( dlen > max_length )); then
+            max_length=$dlen
+        fi
     done
 
-    # If the title length is greater than max message length, adjust width
-    local title_length=$((${#icon} + ${#title}))
-    if [ $title_length -gt $max_length ]; then
-        max_length=$title_length
+    # Prepare the title and update max_length if needed.
+    if [ -n "$title" ]; then
+        local title_length
+        title_length=$(display_length "$title")
+        if (( title_length > max_length )); then
+            max_length=$title_length
+        fi
     fi
 
-    # Adjust box width dynamically based on the longest line
+    # Calculate the total box width (4 extra characters for borders and spaces).
     local box_width=$((max_length + 4))
 
-    # Print top border with icon and title
+    # Print the top border.
+    printf "${color}┌"
+    repeat_char "─" $((box_width - 2))
+    printf "┐\n"
+
+    # If a title is provided, print the title line and a separator.
     if [ -n "$title" ]; then
-        printf "${color}┌%*s┐${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
-        printf "${color}│ %-${max_length}s │${COLOR_RESET}\n" "${icon} ${title}"
-        printf "${color}├%*s┤${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
+        local title_length
+        title_length=$(display_length "$title")
+        local pad=$((max_length - title_length))
+        printf "${color}│ %s" "$title"
+        repeat_char " " "$pad"
+        printf " │\n"
+        printf "${color}├"
+        repeat_char "─" $((box_width - 2))
+        printf "┤\n"
     fi
 
-    # Print message content
+    # Print each wrapped message line with proper manual padding.
     for line in "${lines[@]}"; do
-        printf "${color}│ %-${max_length}s │${COLOR_RESET}\n" "$line"
+        dlen=$(display_length "$line")
+        local pad=$((max_length - dlen))
+        printf "${color}│ %s" "$line"
+        repeat_char " " "$pad"
+        printf " │\n"
     done
 
-    # Print bottom border with proper ASCII characters
-    printf "${color}└%*s┘${COLOR_RESET}\n" $((box_width - 2)) | tr " " "─"
+    # Print the bottom border.
+    printf "${color}└"
+    repeat_char "─" $((box_width - 2))
+    printf "┘\n"
     echo -e "${COLOR_RESET}"
 }
 
@@ -2796,30 +3287,57 @@ print_message_box() {
 
 # Main check for Firefly III installation or update
 if check_firefly_installation; then
-    # Update Firefly III
-    if ! update_firefly; then
-        error "Firefly III update failed."
-        # Decide whether to exit or proceed
-        # For example, you might choose to exit:
-        exit 1
-        # Or you can choose to proceed to the next steps
+    # Get the installed version
+    installed_version=$(check_firefly_version)
+
+    # Fetch the latest available version
+    latest_version=$(get_latest_firefly_version)
+
+    if [ -z "$latest_version" ]; then
+        error "Failed to retrieve the latest Firefly III version. Skipping update check."
+    else
+        info "Installed version: $installed_version"
+        info "Latest available version: $latest_version"
+
+        if [ "$installed_version" = "$latest_version" ]; then
+            success "Firefly III is already up-to-date. No update needed."
+        else
+            info "Updating Firefly III from $installed_version to $latest_version..."
+            if ! update_firefly; then
+                error "Firefly III update failed."
+                exit 1
+            fi
+        fi
     fi
 else
     # Fresh installation of Firefly III
     if ! install_firefly; then
         error "Firefly III installation failed."
-        # Decide whether to exit or proceed
         exit 1
     fi
-
 fi
 
 # Main check for Firefly Importer installation or update
 if check_firefly_importer_installation; then
-    # Update Firefly Importer
-    if ! update_firefly_importer; then
-        error "Firefly Importer update failed."
-        exit 1
+    # Similar check for Firefly Importer
+    installed_importer_version=$(check_firefly_importer_version)
+    latest_importer_version=$(get_latest_importer_version)
+
+    if [ -z "$latest_importer_version" ]; then
+        error "Failed to retrieve the latest Firefly Importer version. Skipping update check."
+    else
+        info "Installed Firefly Importer version: $installed_importer_version"
+        info "Latest available Firefly Importer version: $latest_importer_version"
+
+        if [ "$installed_importer_version" = "$latest_importer_version" ]; then
+            success "Firefly Importer is already up-to-date. No update needed."
+        else
+            info "Updating Firefly Importer from $installed_importer_version to $latest_importer_version..."
+            if ! update_firefly_importer; then
+                error "Firefly Importer update failed."
+                exit 1
+            fi
+        fi
     fi
 else
     # Fresh installation of Firefly Importer
@@ -2832,15 +3350,25 @@ fi
 # Save credentials after installation
 save_credentials
 
-# Use this function as below for cleaner output:
-final_message="Installation and Update Process Completed"
-print_message_box "${COLOR_GREEN}" "${final_message}" "PROCESS COMPLETE" "✔"
+# Ensure variables are not empty before displaying them
+if [ -z "$installed_version" ]; then
+    installed_version="Unknown"
+fi
+
+if [ -z "$installed_importer_version" ]; then
+    installed_importer_version="Unknown"
+fi
+
+# Print final message
+echo ""
+final_message="Installation and Update Process Completed\nFirefly III Version: $installed_version\nFirefly Importer Version: $installed_importer_version"
+print_message_box "${COLOR_GREEN}" "${final_message}" "PROCESS COMPLETE"
 
 access_message="Firefly III: http://${server_ip}:80\nFirefly Importer: http://${server_ip}:8080"
-print_message_box "${COLOR_CYAN}" "${access_message}" "ACCESS INFORMATION" "⚙"
+print_message_box "${COLOR_CYAN}" "${access_message}" "ACCESS INFORMATION"
 
 config_message="Configuration Files:\nFirefly III: ${FIREFLY_INSTALL_DIR}/.env\nFirefly Importer: ${IMPORTER_INSTALL_DIR}/.env\nCron Job: /etc/cron.d/firefly-iii-cron\nCredentials: /root/firefly_credentials.txt"
-print_message_box "${COLOR_YELLOW}" "${config_message}" "CONFIGURATION FILES" "⚙"
+print_message_box "${COLOR_YELLOW}" "${config_message}" "CONFIGURATION FILES"
 
 log_message="Log File: ${LOG_FILE}\nView Logs: cat ${LOG_FILE}\nLogs older than 7 days auto-deleted."
-print_message_box "${COLOR_BLUE}" "${log_message}" "LOG DETAILS" "📄"
+print_message_box "${COLOR_BLUE}" "${log_message}" "LOG DETAILS"
