@@ -2188,9 +2188,6 @@ install_firefly() {
     chown -R www-data:www-data /var/www/.cache/composer
     chmod -R 775 /var/www/.cache/composer
 
-    info "Clearing Composer cache..."
-    composer clear-cache 2>/dev/null || true
-
     # Step 11: Run composer install if vendor directory is missing
     if [ ! -d "$FIREFLY_INSTALL_DIR/vendor" ]; then
         info "Running composer install for Firefly III..."
@@ -2541,9 +2538,6 @@ setup_composer_for_importer() {
     chown -R www-data:www-data /var/www/.cache/composer
     chmod -R 775 /var/www/.cache/composer
 
-    info "Clearing Composer cache..."
-    composer clear-cache 2>/dev/null || true
-    
     return 0
 }
 
@@ -3085,9 +3079,6 @@ update_firefly() {
         mkdir -p /var/www/.cache/composer/files/
         chown -R www-data:www-data /var/www/.cache/composer
         chmod -R 775 /var/www/.cache/composer
-
-        info "Clearing Composer cache..."
-        composer clear-cache 2>/dev/null || true
 
         info "Running composer install to update dependencies..."
         cd "$FIREFLY_INSTALL_DIR"
