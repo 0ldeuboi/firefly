@@ -19,7 +19,7 @@
 #
 #####################################################################################################################################################
 
-# Define colors and bold formatting for messages
+# Define colors and formatting
 COLOR_RESET="\033[0m"
 COLOR_RED="\033[31m"
 COLOR_GREEN="\033[32m"
@@ -28,6 +28,9 @@ COLOR_BLUE="\033[34m"
 COLOR_CYAN="\033[36m"
 BOLD="\033[1m"
 RESET="\033[0m"
+
+# Define a variable for clearing the line
+CLEAR_LINE="\r\033[K"
 
 # Functions for colored output
 # Logs informational messages to stderr and the log file
@@ -171,15 +174,15 @@ show_progress() {
     # Create the progress bar
     local progress_bar="["
     for ((i=0; i<bars; i++)); do
-        progress_bar+="#"
+        progress_bar+="${COLOR_GREEN}#${COLOR_RESET}"
     done
     for ((i=bars; i<20; i++)); do
         progress_bar+="."
     done
     progress_bar+="]"
     
-    # Clear the current line and print the progress
-    echo -ne "\r\033[K${COLOR_CYAN}${operation_name}${COLOR_RESET}: ${progress_bar} ${percentage}% - ${operation_status}"
+    # Use the CLEAR_LINE variable
+    echo -ne "${CLEAR_LINE}${COLOR_CYAN}${operation_name}${COLOR_RESET}: ${progress_bar} ${percentage}% - ${operation_status}"
     
     # If we're at 100% or persist is requested, add a newline
     if [ "$percentage" -eq 100 ] || [ "$persist" = "true" ]; then
@@ -274,10 +277,21 @@ composer_install_with_progress() {
     local estimated_time=120  # seconds
     local start_time=$(date +%s)
     
-    # Start composer in background with output to both console log and log file
+    # Create temporary file for collecting full output (for log)
+    local full_output=$(mktemp)
+    
+    # Run composer with all output redirected to our temporary file and the log
+    # This completely suppresses terminal output, letting us control what's shown
     PHP_DEPRECATION_WARNINGS=0 COMPOSER_DISABLE_XDEBUG_WARN=1 COMPOSER_MEMORY_LIMIT=-1 COMPOSER_ALLOW_SUPERUSER=1 \
-    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader > >(tee -a "$LOG_FILE" > /tmp/composer.log) 2> >(tee -a "$LOG_FILE" >&2) &
+    sudo -u www-data composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader \
+    > >(tee -a "$LOG_FILE" > "$full_output") \
+    2> >(tee -a "$LOG_FILE" >/dev/null) &
     local composer_pid=$!
+    
+    # Initialize status
+    local status="Starting installation..."
+    local last_update=""
+    local important_phases=0
     
     # While composer is running, update progress
     while kill -0 $composer_pid 2>/dev/null; do
@@ -290,15 +304,38 @@ composer_install_with_progress() {
             progress=99
         fi
         
-        # Get the last line from composer output for status
-        local status=$(tail -n 1 /tmp/composer.log | tr -d '\r')
-        show_progress "Composer Installation" "$progress" 100 "$status"
+        # Check output for significant markers to update status and progress
+        if [ -f "$full_output" ]; then
+            # Look for key progress indicators in the output
+            if grep -q "Installing dependencies from lock file" "$full_output" && [ "$important_phases" -eq 0 ]; then
+                status="Installing dependencies..."
+                important_phases=1
+                progress=10
+            elif grep -q "Generating optimized autoload files" "$full_output" && [ "$important_phases" -eq 1 ]; then
+                status="Generating autoload files..."
+                important_phases=2
+                progress=60
+            elif grep -q "firefly-iii:instructions" "$full_output" && [ "$important_phases" -eq 2 ]; then
+                status="Running post-install commands..."
+                important_phases=3
+                progress=80
+            fi
+        fi
+        
+        # Only update the progress display if status has changed or every 5 seconds
+        if [ "$status" != "$last_update" ] || [ $((current_time % 5)) -eq 0 ]; then
+            show_progress "Composer Installation" "$progress" 100 "$status"
+            last_update="$status"
+        fi
         
         sleep 1
     done
     
     # Show 100% when complete
     show_progress "Composer Installation" 100 100 "Installation complete" "true"
+    
+    # Clean up
+    rm -f "$full_output"
     
     # Log completion of composer install
     echo "$(date +'%Y-%m-%d %H:%M:%S') [INFO] Finished composer install in $directory" >> "$LOG_FILE"
@@ -362,6 +399,310 @@ monitor_command_progress() {
     local exit_code=$?
     echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Exit code: $exit_code" >> "$LOG_FILE"
     return $exit_code
+}
+
+# Function to run PHP Artisan commands with filtered output and progress tracking
+# Parameters:
+#   command: The artisan command to run
+#   description: Description for the progress bar
+# Returns:
+#   The exit code of the command
+run_artisan_command_with_progress() {
+    local command="$1"
+    local description="$2"
+    
+    info "Running command: php artisan $command"
+    
+    # Log the full command output
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Executing: php artisan $command" >> "$LOG_FILE"
+    
+    # Create temporary files for output capture
+    local temp_output=$(mktemp)
+    local progress=0
+    
+    # Function to show persistent progress updates
+    update_progress() {
+        local current_progress=$1
+        local status="${2:-Running command...}"
+        show_progress "$description" "$current_progress" 100 "$status"
+    }
+    
+    # Run the command and capture output
+    (
+        # Start with initial progress
+        update_progress 5 "Starting command..."
+        
+        # Run the command with output captured
+        sudo -u www-data php artisan $command 2>&1 | tee "$temp_output" >> "$LOG_FILE" &
+        local cmd_pid=$!
+        
+        # Monitor progress while command runs
+        local progress=10
+        while kill -0 $cmd_pid 2>/dev/null; do
+            # Gradually increase progress but cap at 95%
+            if [ "$progress" -lt 95 ]; then
+                progress=$((progress + 1))
+                
+                # Extract meaningful status update from output if available
+                local status="Running..."
+                if [ -f "$temp_output" ]; then
+                    # Try to find a recent informative line for status
+                    local last_line=$(grep -E '^\s*(Running|Executing|\[i\]|\[✓\])' "$temp_output" | tail -n1)
+                    if [ -n "$last_line" ]; then
+                        # Extract meaningful part of the line (up to 40 chars)
+                        status=$(echo "$last_line" | sed -E 's/^\s*(\[.?\]|\s*)//' | cut -c 1-40)
+                        if [ ${#status} -eq 40 ]; then
+                            status="${status}..."
+                        fi
+                    fi
+                fi
+                
+                update_progress "$progress" "$status"
+            fi
+            sleep 0.3
+        done
+        
+        # Wait for command to complete and get exit code
+        wait $cmd_pid
+        local exit_code=$?
+        
+        # Show 100% when complete
+        update_progress 100 "Complete" 
+        
+        # Log completion and exit code
+        echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Completed: php artisan $command (Exit code: $exit_code)" >> "$LOG_FILE"
+        
+        # Return the exit code
+        return $exit_code
+    )
+    
+    # Get the exit code from the subshell
+    local result=$?
+    
+    # Clean up
+    rm -f "$temp_output"
+    
+    return $result
+}
+
+# Function to run apt commands with progress tracking
+# Parameters:
+#   command: The apt command to run
+#   description: Description for the progress display
+# Returns:
+#   The exit code of the command
+run_apt_with_progress() {
+    local command="$1"
+    local description="$2"
+    
+    # Log the command
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Executing: $command" >> "$LOG_FILE"
+    
+    # Create temp file for output
+    local temp_output=$(mktemp)
+    
+    # Start with initial progress
+    show_progress "$description" 5 100 "Starting..."
+    
+    # Run the command with output captured to both log and temp file
+    # Redirect stderr to stdout so we can capture everything
+    eval "$command" > >(tee -a "$LOG_FILE" > "$temp_output") 2>&1 &
+    local cmd_pid=$!
+    
+    # Monitor progress while command runs
+    local progress=10
+    local last_update=""
+    local start_time=$(date +%s)
+    
+    while kill -0 $cmd_pid 2>/dev/null; do
+        # Get current progress based on elapsed time (capped at 95%)
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        # Gradually increase progress but cap at 95%
+        progress=$((10 + (elapsed * 85 / 30)))  # Assume most operations take ~30 seconds
+        if [ "$progress" -gt 95 ]; then
+            progress=95
+        fi
+        
+        # Get status update from last line of output
+        local status=""
+        if [ -f "$temp_output" ]; then
+            status=$(tail -n1 "$temp_output" | grep -v "^$" | tr -d '\r' | cut -c 1-40)
+            if [ ${#status} -eq 40 ]; then
+                status="${status}..."
+            fi
+            
+            # If no meaningful line found, use a generic message
+            if [ -z "$status" ]; then
+                status="Processing..."
+            fi
+        fi
+        
+        # Update progress display if status changed or every 2 seconds
+        if [ "$status" != "$last_update" ] || [ $((current_time % 2)) -eq 0 ]; then
+            show_progress "$description" "$progress" 100 "$status"
+            last_update="$status"
+        fi
+        
+        sleep 0.5
+    done
+    
+    # Wait for process to finish and get exit code
+    wait $cmd_pid
+    local exit_code=$?
+    
+    # Show 100% when complete
+    show_progress "$description" 100 100 "Complete" "true"
+    
+    # Log completion
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [CMD] Completed: $command (Exit code: $exit_code)" >> "$LOG_FILE"
+    
+    # Clean up
+    rm -f "$temp_output"
+    
+    return $exit_code
+}
+
+# Function to update system packages
+# Returns:
+#   0 if update succeeded, 1 if failed
+update_system_packages() {
+    info "Updating package lists and upgrading system packages..."
+    
+    # Update package lists
+    if ! run_apt_with_progress "apt-get update" "Updating Package Lists"; then
+        error "Failed to update package lists. Check your internet connection and repository settings."
+        return 1
+    fi
+
+    # Upgrade installed packages
+    if ! run_apt_with_progress "apt-get full-upgrade -y" "Upgrading Packages"; then
+        warning "Some package upgrades may have failed. Continuing anyway..."
+    fi
+
+    # Remove unused packages
+    if ! run_apt_with_progress "apt-get auto-remove -y" "Removing Unused Packages"; then
+        warning "Auto-remove process may have encountered issues. Continuing anyway..."
+    fi
+    
+    success "System packages updated successfully."
+    return 0
+}
+
+# Function to check and install required commands
+# Parameters:
+#   cmd_list: Space-separated list of required commands
+# Returns:
+#   0 if all commands are available or were installed successfully, 1 if failed
+ensure_commands_installed() {
+    local cmd_list="$1"
+    local missing_cmds=()
+    
+    info "Checking for required commands: $cmd_list"
+    
+    # Check which commands are missing
+    for cmd in $cmd_list; do
+        if ! command -v $cmd &>/dev/null; then
+            missing_cmds+=("$cmd")
+        fi
+    done
+    
+    # Install missing commands
+    if [ ${#missing_cmds[@]} -gt 0 ]; then
+        info "Installing missing commands: ${missing_cmds[*]}"
+        for cmd in "${missing_cmds[@]}"; do
+            warning "Command '$cmd' is missing. Installing it now..."
+            if ! run_apt_with_progress "apt-get install -y $cmd" "Installing $cmd"; then
+                error "Failed to install '$cmd'. Please install it manually and re-run the script."
+                return 1
+            fi
+            success "Successfully installed $cmd"
+        done
+    else
+        info "All required commands are already installed."
+    fi
+    
+    return 0
+}
+
+# Function to ensure Apache is installed and configured correctly
+# Returns:
+#   0 if Apache is available and configured correctly, 1 if failed
+ensure_apache_installed() {
+    info "Checking if Apache is installed..."
+    
+    if ! command -v apachectl &>/dev/null; then
+        info "Apache is not installed. Proceeding to install Apache..."
+        
+        if ! run_apt_with_progress "apt-get install -y apache2" "Installing Apache"; then
+            error "Failed to install Apache. Please check your network connection and package manager settings, and then try installing Apache manually with 'apt-get install apache2'."
+            return 1
+        fi
+
+        # Start Apache after installation
+        info "Starting Apache service..."
+        if ! systemctl start apache2; then
+            error "Failed to start Apache. Please check the system logs for more details and manually start the service using 'systemctl start apache2'."
+            return 1
+        fi
+
+        success "Apache installed and started successfully."
+    else
+        info "Apache is already installed. Checking configuration..."
+        
+        # Test Apache configuration
+        if ! apachectl configtest &>/dev/null; then
+        error "Apache is installed but the configuration is incorrect."
+        if [ "$NON_INTERACTIVE" = true ]; then
+            error "Exiting in non-interactive mode."
+            return 1
+        fi
+
+        while true; do
+            prompt "Do you want to try fixing the configuration and retry? (Y/n): "
+            read RETRY_APACHE
+            RETRY_APACHE=${RETRY_APACHE:-Y}
+
+            if validate_input "$RETRY_APACHE" "yes_no"; then
+                if [[ "$RETRY_APACHE" =~ ^[Yy]$ ]]; then
+                    info "Retrying Apache configuration test..."
+                    if ! apachectl configtest; then
+                        error "Apache configuration test failed again."
+                        return 1
+                    fi
+                else
+                    error "Exiting due to Apache configuration errors."
+                    return 1
+                fi
+                break
+            else
+                error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            fi
+        done
+    fi
+
+        success "Apache is already installed and configured correctly."
+    fi
+    
+    return 0
+}
+
+# Main system preparation function
+# Returns:
+#   0 if preparation succeeded, 1 if failed
+prepare_system() {
+    # Update system packages
+    update_system_packages || return 1
+    
+    # Ensure required commands are installed
+    ensure_commands_installed "curl jq wget unzip openssl gpg" || return 1
+    
+    # Ensure Apache is installed and configured correctly
+    ensure_apache_installed || return 1
+    
+    success "System preparation completed successfully."
+    return 0
 }
 
 # Ensure the script is run as root
@@ -952,8 +1293,18 @@ check_php_compatibility() {
                 fi
                 return 0
             else
-                prompt "Would you like to install PHP $compatible_php_version? (y/N): "
-                read UPGRADE_PHP_INPUT
+                while true; do
+                    prompt "Would you like to install PHP $compatible_php_version? (y/N): "
+                    read UPGRADE_PHP_INPUT
+                    UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-N}
+
+                    if validate_input "$UPGRADE_PHP_INPUT" "yes_no"; then
+                        break
+                    else
+                        error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+                    fi
+                done
+
                 if [[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]]; then
                     if ! install_php_version "$compatible_php_version"; then
                         error "Failed to install PHP $compatible_php_version. Try manually installing PHP with 'apt-get install php$compatible_php_version'."
@@ -1554,23 +1905,46 @@ extract_archive() {
 
     info "Extracting $archive_file to $dest_dir..."
     
-    # Step 1: Check the archive type and extract accordingly
+    # Step 1: Determine the number of files in the archive
+    local total_files=0
     if [[ "$archive_file" == *.zip ]]; then
-        unzip -q "$archive_file" -d "$dest_dir" || {
-            error "Extraction failed: Could not extract $archive_file into $dest_dir. Ensure the file is valid and permissions are correct. Try running: unzip -t \"$archive_file\" to test the archive."
-            return 1
-        }
+        total_files=$(unzip -l "$archive_file" | grep -E '\.*/?$' | wc -l)
     elif [[ "$archive_file" == *.tar.gz ]]; then
-        mkdir -p "$dest_dir"
-        tar -xzf "$archive_file" -C "$dest_dir" || {
-            error "Extraction failed: Could not extract $archive_file into $dest_dir. Ensure the file is valid and permissions are correct. Try running: tar -tzf \"$archive_file\" to test the archive."
-            return 1
-        }
+        total_files=$(tar -tzf "$archive_file" | wc -l)
     else
-        error "Unsupported archive format: $archive_file. Only zip and tar.gz files are supported. Check the file extension and try again."
+        error "Unsupported archive format: $archive_file. Only zip and tar.gz files are supported."
         return 1
     fi
 
+    # Ensure total_files is valid
+    if [[ "$total_files" -le 0 ]]; then
+        error "Failed to determine the number of files in the archive."
+        return 1
+    fi
+
+    # Create destination directory
+    mkdir -p "$dest_dir"
+
+    local extracted_files=0  # Track extracted files
+
+    if [[ "$archive_file" == *.zip ]]; then
+        unzip -o "$archive_file" -d "$dest_dir" > /dev/null &  # Run in background
+        zip_pid=$!
+
+        # Monitor extraction progress
+        while kill -0 $zip_pid 2>/dev/null; do
+            extracted_files=$(ls -1 "$dest_dir" | wc -l)  # Count extracted files
+            show_progress "Extracting" "$extracted_files" "$total_files"
+            sleep 0.5  # Small delay for smoother updates
+        done
+    elif [[ "$archive_file" == *.tar.gz ]]; then
+        tar -xzf "$archive_file" -C "$dest_dir" --checkpoint=1 --checkpoint-action=echo=1 2>/dev/null | while read -r line; do
+            ((extracted_files++))
+            show_progress "Extracting" "$extracted_files" "$total_files"
+        done
+    fi
+
+    echo ""  # Ensure a newline after progress bar completion
     success "Extraction of $archive_file into $dest_dir completed successfully."
 }
 
@@ -1611,15 +1985,42 @@ setup_env_file() {
         DB_CHOICE="mysql" # Default to MySQL in non-interactive mode
         info "Using MySQL for database in non-interactive mode."
     else
-        prompt "Which database do you want to use? [mysql/sqlite] (default: mysql): "
-        read DB_CHOICE
-        DB_CHOICE=${DB_CHOICE:-mysql}
+        echo "Select the database type:"
+        echo "1) MySQL"
+        echo "2) SQLite"
+        
+        while true; do
+            prompt "Enter your choice [1-2] (default: 1): "
+            read DB_SELECTION
+            DB_SELECTION=${DB_SELECTION:-1}
+
+            if validate_input "$DB_SELECTION" "number"; then
+                case "$DB_SELECTION" in
+                    1) DB_CHOICE="mysql"; break ;;
+                    2) DB_CHOICE="sqlite"; break ;;
+                    *)
+                        error "Invalid option. Please select 1 for MySQL or 2 for SQLite."
+                esac
+            else
+                error "Invalid input. Please enter a number (1 for MySQL, 2 for SQLite)."
+            fi
+        done
+
+        case "$DB_SELECTION" in
+            1) DB_CHOICE="mysql" ;;
+            2) DB_CHOICE="sqlite" ;;
+            *)
+                error "Invalid option selected. Please restart the script and choose a valid option."
+                return 1
+                ;;
+        esac
     fi
 
     # Step 4: Configure database based on user choice
-    if [[ "$DB_CHOICE" =~ ^[Ss][Qq][Ll][Ii][Tt][Ee]$ ]]; then
+    if [[ "$DB_CHOICE" == "sqlite" ]]; then
         # Use SQLite
         info "Configuring SQLite database..."
+        
         # Update .env file to use SQLite
         sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=sqlite/' "$target_dir/.env"
         sed -i '/DB_HOST/d' "$target_dir/.env"
@@ -1632,6 +2033,7 @@ setup_env_file() {
         mkdir -p "$target_dir/storage/database"
         touch "$target_dir/storage/database/database.sqlite"
         chown -R www-data:www-data "$target_dir/storage/database"
+
     else
         # Use MySQL
         info "Configuring MySQL database..."
@@ -1652,26 +2054,58 @@ setup_env_file() {
         default_db_user="user_$(generate_sensible_name)"
 
         # Step 5: Prompt user for database info or use defaults
-        if [ "$NON_INTERACTIVE" = true ]; then
-            # Use default values in non-interactive mode
-            DB_NAME="${DB_NAME:-$default_db_name}"
-            DB_USER="${DB_USER:-$default_db_user}"
-            DB_PASS="${DB_PASS:-$(openssl rand -base64 16)}"
-        else
-            # Interactive mode: prompt the user for input
+    if [ "$NON_INTERACTIVE" = true ]; then
+        # Use default values in non-interactive mode
+        DB_NAME="${DB_NAME:-$default_db_name}"
+        DB_USER="${DB_USER:-$default_db_user}"
+        DB_PASS="${DB_PASS:-$(openssl rand -base64 16)}"
+    else
+        # Interactive mode: prompt the user for input
+        while true; do
             prompt "Enter the database name (press Enter for default: $default_db_name): "
             read DB_NAME_INPUT
             DB_NAME=${DB_NAME_INPUT:-$default_db_name}
 
+            if validate_input "$DB_NAME" "domain"; then
+                break
+            else
+                error "Invalid database name. Only letters, numbers, underscores, and dashes are allowed."
+            fi
+        done
+
+        while true; do
             prompt "Enter the database username (press Enter for default: $default_db_user): "
             read DB_USER_INPUT
             DB_USER=${DB_USER_INPUT:-$default_db_user}
 
+            if validate_input "$DB_USER" "domain" "Invalid username. Only letters, numbers, underscores, and dashes are allowed."; then
+                break
+            fi
+        done
+
+        while true; do
             prompt "Enter the database password (press Enter for a randomly generated password): "
             read -s DB_PASS_INPUT
-            DB_PASS=${DB_PASS_INPUT:-"$(openssl rand -base64 16)"}
             echo
-        fi
+
+            if [ -z "$DB_PASS_INPUT" ]; then
+                DB_PASS="$(openssl rand -base64 16)"
+                info "A secure random password has been generated."
+                break
+            fi
+
+            prompt "Confirm your database password: "
+            read -s DB_PASS_CONFIRM
+            echo
+
+            if [ "$DB_PASS_INPUT" != "$DB_PASS_CONFIRM" ]; then
+                error "Passwords do not match. Please try again."
+            else
+                DB_PASS="$DB_PASS_INPUT"
+                break
+            fi
+        done
+    fi
 
         DB_HOST="127.0.0.1"
 
@@ -1719,11 +2153,28 @@ create_mysql_db() {
     # Step 1: Prompt for MySQL root password or use unix_socket authentication only if not set
     if [ -z "$MYSQL_ROOT_PASS" ]; then
         if [ "$NON_INTERACTIVE" = true ]; then
-            MYSQL_ROOT_PASS=""
+            MYSQL_ROOT_PASS=""  # Default to empty in non-interactive mode (uses unix_socket)
         else
-            prompt "Enter the MySQL root password (leave blank to use unix_socket authentication): "
-            read -s MYSQL_ROOT_PASS
-            echo
+            while true; do
+                prompt "Enter the MySQL root password (press Enter to skip and use unix_socket authentication): "
+                read -s MYSQL_ROOT_PASS
+                echo
+
+                if [ -z "$MYSQL_ROOT_PASS" ]; then
+                    warning "Using unix_socket authentication (no password required)."
+                    break
+                fi
+
+                prompt "Confirm your MySQL root password: "
+                read -s MYSQL_ROOT_PASS_CONFIRM
+                echo
+
+                if [ "$MYSQL_ROOT_PASS" != "$MYSQL_ROOT_PASS_CONFIRM" ]; then
+                    error "Passwords do not match. Please try again."
+                else
+                    break  # Exit loop if passwords match
+                fi
+            done
         fi
     fi
 
@@ -1892,8 +2343,8 @@ configure_php() {
 
 # Function to configure SSL certificates
 # Parameters:
-#   domain_name: The domain name for the certificate
-#   email_address: The email address for Let's Encrypt registration
+#   $1 - domain_name: The domain name for the certificate (if already set)
+#   $2 - email_address: The email address for Let's Encrypt registration (if already set)
 # Returns:
 #   0 if certificate setup succeeded, 1 if failed
 configure_ssl() {
@@ -1901,23 +2352,40 @@ configure_ssl() {
     local email_address="$2"
     
     info "Configuring SSL certificate for $domain_name..."
-    
-    # Step 1: Validate domain name and email address
-    if ! validate_input "$domain_name" "domain" "Invalid domain name format: $domain_name"; then
-        return 1
-    fi
-    
-    if ! validate_input "$email_address" "email" "Invalid email address format: $email_address"; then
-        return 1
-    fi
-    
-    # Step 2: Check if certificates already exist
+
+    # Step 1: Check if a domain name is already set; if not, prompt for one
+    while [ -z "$domain_name" ]; do
+        prompt "Enter your domain name (e.g., example.com): "
+        read domain_name
+
+        if validate_input "$domain_name" "domain"; then
+            break
+        else
+            error "Invalid domain format. Please enter a valid domain (e.g., example.com)."
+            domain_name=""
+        fi
+    done
+
+    # Step 2: Check if an email address is already set; if not, prompt for one
+    while [ -z "$email_address" ]; do
+        prompt "Enter your email address (e.g., user@example.com): "
+        read email_address
+
+        if validate_input "$email_address" "email"; then
+            break
+        else
+            error "Invalid email format. Please provide a valid email (e.g., user@example.com)."
+            email_address=""
+        fi
+    done
+
+    # Step 3: Check if SSL certificates already exist for this domain
     if [ -d "/etc/letsencrypt/live/$domain_name" ]; then
         info "SSL certificates already exist for $domain_name. Skipping certificate generation."
         return 0
     fi
-    
-    # Step 3: Obtain certificate using Let's Encrypt
+
+    # Step 4: Obtain SSL certificate using Let's Encrypt
     info "Obtaining SSL certificate using Let's Encrypt for $domain_name..."
     if ! certbot --apache --non-interactive --agree-tos --email "$email_address" -d "$domain_name"; then
         error "Failed to obtain SSL certificate. Please check:
@@ -1927,7 +2395,7 @@ configure_ssl() {
 4. Apache configuration (must be running and correctly configured)"
         return 1
     fi
-    
+
     success "SSL certificate successfully obtained for $domain_name."
     return 0
 }
@@ -2060,10 +2528,18 @@ install_firefly() {
             UPGRADE_PHP=${UPGRADE_NEEDED}
         else
             if [ "$UPGRADE_NEEDED" = true ]; then
-                prompt "A newer stable PHP version ($LATEST_PHP_VERSION) is available. Do you want to upgrade? (Y/n): "
-                read UPGRADE_PHP_INPUT
-                UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-Y}
-                UPGRADE_PHP=$([[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]] && echo true || echo false)
+                while true; do
+                    prompt "A newer stable PHP version ($LATEST_PHP_VERSION) is available. Do you want to upgrade? (Y/n): "
+                    read UPGRADE_PHP_INPUT
+                    UPGRADE_PHP_INPUT=${UPGRADE_PHP_INPUT:-Y}  # Default to "Y" if no input
+
+                    if validate_input "$UPGRADE_PHP_INPUT" "yes_no"; then
+                        UPGRADE_PHP=$([[ "$UPGRADE_PHP_INPUT" =~ ^[Yy]$ ]] && echo true || echo false)
+                        break  # Exit loop if input is valid
+                    else
+                        error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+                    fi
+                done
             else
                 UPGRADE_PHP=false
                 info "PHP is up to date."
@@ -2079,9 +2555,17 @@ install_firefly() {
             if [ "$NON_INTERACTIVE" = true ]; then
                 RETAIN_OLD_PHP="N" # Default to not retaining old PHP versions in non-interactive mode
             else
-                prompt "Do you want to retain older PHP versions? (y/N): "
-                read RETAIN_OLD_PHP
-                RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
+                while true; do
+                    prompt "Do you want to retain older PHP versions? (y/N): "
+                    read RETAIN_OLD_PHP
+                    RETAIN_OLD_PHP=${RETAIN_OLD_PHP:-N}
+
+                    if validate_input "$RETAIN_OLD_PHP" "yes_no"; then
+                        break
+                    else
+                        error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+                    fi
+                done
             fi
 
             if [[ "$RETAIN_OLD_PHP" =~ ^[Yy]$ ]]; then
@@ -2143,31 +2627,46 @@ install_firefly() {
             EMAIL_ADDRESS=""
         fi
     else
-        prompt "Do you have a registered domain name you want to use? (y/N): "
-        read HAS_DOMAIN_INPUT
-        HAS_DOMAIN_INPUT=${HAS_DOMAIN_INPUT:-N}
+        while true; do
+            prompt "Do you have a registered domain name you want to use? (y/N): "
+            read HAS_DOMAIN_INPUT
+            HAS_DOMAIN_INPUT=${HAS_DOMAIN_INPUT:-N}  # Default to 'N' if Enter is pressed
+
+            if validate_input "$HAS_DOMAIN_INPUT" "yes_no"; then
+                break  # Exit loop if input is valid
+            else
+                error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            fi
+        done
 
         if [[ "$HAS_DOMAIN_INPUT" =~ ^[Yy]$ ]]; then
             HAS_DOMAIN=true
-            prompt "Enter your domain name (e.g., example.com): "
-            read DOMAIN_NAME
-            DOMAIN_NAME=${DOMAIN_NAME:-example.com}
 
-            # Validate domain name
-            if ! validate_input "$DOMAIN_NAME" "domain"; then
-                error "Invalid domain name format. Please restart the script and provide a valid domain."
-                return 1
-            fi
+            # Loop until a valid domain is entered
+            while true; do
+                prompt "Enter your domain name (e.g., example.com): "
+                read DOMAIN_NAME
+                DOMAIN_NAME=${DOMAIN_NAME:-example.com}  # Default to example.com if empty
 
-            prompt "Enter your email address for SSL certificate registration: "
-            read EMAIL_ADDRESS
-            EMAIL_ADDRESS=${EMAIL_ADDRESS:-your-email@example.com}
+                if validate_input "$DOMAIN_NAME" "domain"; then
+                    break  # Exit loop if valid domain is provided
+                else
+                    error "Invalid domain format: $DOMAIN_NAME. Please enter a valid domain (e.g., example.com)."
+                fi
+            done
 
-            # Validate email address
-            if ! validate_input "$EMAIL_ADDRESS" "email"; then
-                error "Invalid email address format. Please restart the script and provide a valid email."
-                return 1
-            fi
+            # Loop until a valid email is entered
+            while true; do
+                prompt "Enter your email address for SSL certificate registration: "
+                read EMAIL_ADDRESS
+                EMAIL_ADDRESS=${EMAIL_ADDRESS:-your-email@example.com}  # Default email if empty
+
+                if validate_input "$EMAIL_ADDRESS" "email"; then
+                    break  # Exit loop if valid email is provided
+                else
+                    error "Invalid email format: $EMAIL_ADDRESS. Please enter a valid email (e.g., user@example.com)."
+                fi
+            done
         else
             HAS_DOMAIN=false
             DOMAIN_NAME=""
@@ -2313,7 +2812,7 @@ setup_app_key() {
     return 0
 }
 
-# Function to run database migrations
+# Function to run database migrations with simplified output
 # Returns:
 #   0 if migrations succeeded, 1 if failed
 run_database_migrations() {
@@ -2321,54 +2820,57 @@ run_database_migrations() {
     info "Checking if database migrations have already been applied..."
     if sudo -u www-data php artisan migrate:status &>/dev/null; then
         info "Migrations have already been applied. Skipping migration step."
+        return 0
     else
         info "No migrations found. Proceeding with database migration."
-        if ! sudo -u www-data php artisan migrate --force; then
+        if ! run_artisan_command_with_progress "migrate --force" "Database Migration"; then
             error "Failed to migrate database with php artisan. Please check:
 1. Database connection settings in .env
 2. If database user has sufficient privileges
 3. If database exists and is accessible"
             return 1
         fi
+        success "Database migrations completed successfully."
     fi
     
     return 0
 }
 
-# Function to update database schema
+# Function to update database schema with simplified output
 # Returns:
 #   0 if update succeeded, 1 if failed
 update_database_schema() {
     info "Updating database schema and correcting any issues..."
     
     # Step 1: Cache configuration
-    if ! sudo -u www-data php artisan config:cache; then
+    if ! run_artisan_command_with_progress "config:cache" "Caching Configuration"; then
         error "Failed to cache configuration with php artisan. Check your .env configuration for errors."
         return 1
     fi
 
     # Step 2: Upgrade database
-    if ! sudo -u www-data php artisan firefly-iii:upgrade-database; then
+    if ! run_artisan_command_with_progress "firefly-iii:upgrade-database" "Upgrading Database"; then
         error "Failed to upgrade Firefly III database. Try running 'php artisan firefly-iii:upgrade-database' manually to see detailed errors."
         return 1
     fi
 
     # Step 3: Correct database
-    if ! sudo -u www-data php artisan firefly-iii:correct-database; then
+    if ! run_artisan_command_with_progress "firefly-iii:correct-database" "Correcting Database"; then
         error "Failed to correct database issues with Firefly III. Try running 'php artisan firefly-iii:correct-database' manually to see detailed errors."
         return 1
     fi
 
     # Step 4: Report integrity
-    if ! sudo -u www-data php artisan firefly-iii:report-integrity; then
+    if ! run_artisan_command_with_progress "firefly-iii:report-integrity" "Checking Database Integrity"; then
         error "Failed to report database integrity issues with Firefly III. Try running 'php artisan firefly-iii:report-integrity' manually to see detailed errors."
         return 1
     fi
     
+    success "Database schema updated and corrected successfully."
     return 0
 }
 
-# Function to install Laravel Passport
+# Function to install Laravel Passport with simplified output
 # Returns:
 #   0 if installation succeeded, 1 if failed
 install_laravel_passport() {
@@ -2382,10 +2884,12 @@ install_laravel_passport() {
         # Escape single quotes in the password
         ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
 
-        if ! sudo -u www-data php artisan passport:install --force --no-interaction; then
+        if ! run_artisan_command_with_progress "passport:install --force --no-interaction" "Installing Laravel Passport"; then
             error "Failed to install Laravel Passport. Try running 'php artisan passport:install --force' manually to see detailed errors."
             return 1
         fi
+        
+        success "Laravel Passport installed successfully."
     else
         info "Passport tables already exist. Skipping Laravel Passport installation."
     fi
@@ -2754,9 +3258,17 @@ update_firefly_importer() {
     if [ "$NON_INTERACTIVE" = true ]; then
         CONFIRM_UPDATE="Y"
     else
-        prompt "Do you want to proceed with the update? (y/N): "
-        read CONFIRM_UPDATE
-        CONFIRM_UPDATE=${CONFIRM_UPDATE:-N}
+        while true; do
+            prompt "Do you want to proceed with the update? (y/N): "
+            read CONFIRM_UPDATE
+            CONFIRM_UPDATE=${CONFIRM_UPDATE:-N}
+
+            if validate_input "$CONFIRM_UPDATE" "yes_no"; then
+                break
+            else
+                error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            fi
+        done
     fi
 
     if [[ "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
@@ -2844,18 +3356,17 @@ setup_cron_job() {
     if [ "$NON_INTERACTIVE" = true ]; then
         CRON_HOUR="${CRON_HOUR:-3}"
     else
-        prompt "Enter the hour (0-23) to run the Firefly III cron job (default: 3): "
-        read CRON_HOUR
-        CRON_HOUR="${CRON_HOUR:-3}"
-        
-        # Validate cron hour
-        if ! validate_input "$CRON_HOUR" "number" "Invalid hour value. Please enter a number between 0 and 23."; then
-            CRON_HOUR="3"
-            info "Using default hour (3) for cron job."
-        elif [ "$CRON_HOUR" -lt 0 ] || [ "$CRON_HOUR" -gt 23 ]; then
-            error "Hour value out of range. Using default hour (3) for cron job."
-            CRON_HOUR="3"
-        fi
+        while true; do
+            prompt "Enter the hour (0-23) to run the Firefly III cron job (default: 3): "
+            read CRON_HOUR
+            CRON_HOUR="${CRON_HOUR:-3}"
+
+            if validate_input "$CRON_HOUR" "number" && [ "$CRON_HOUR" -ge 0 ] && [ "$CRON_HOUR" -le 23 ]; then
+                break
+            else
+                error "Invalid input. Please enter a number between 0 and 23."
+            fi
+        done
     fi
 
     # Step 2: Specify environment variables for cron job
@@ -2947,22 +3458,35 @@ save_credentials() {
 
     # Step 2: If running in interactive mode, prompt for passphrase to encrypt
     if [ "$NON_INTERACTIVE" = false ]; then
-        prompt "Enter a passphrase to encrypt the credentials (leave blank to skip encryption): "
-        read -s PASSPHRASE
+        # Check if gpg is installed, install if missing
+        if ! command -v gpg &>/dev/null; then
+            warning "gpg not found. Installing it now..."
+            apt-get install -y gnupg
+            if ! command -v gpg &>/dev/null; then
+                error "Failed to install gpg. Credentials cannot be encrypted."
+                return 1
+            fi
+        fi
 
-        if [ -n "$PASSPHRASE" ]; then
-            info "Encrypting credentials file with gpg for security..."
-            if command -v gpg &>/dev/null; then
-                if gpg --batch --yes --passphrase "$PASSPHRASE" -c "$CREDENTIALS_FILE"; then
-                    rm "$CREDENTIALS_FILE"
-                    success "Credentials saved and encrypted at $CREDENTIALS_FILE.gpg."
-                    warning "Please keep this file safe and decrypt it using 'gpg --decrypt $CREDENTIALS_FILE.gpg'."
-                else
-                    error "Failed to encrypt credentials file. The file remains unencrypted. Try manually encrypting with 'gpg -c $CREDENTIALS_FILE'."
-                fi
+        # Prompt user for passphrase
+        while true; do
+            prompt "Enter a passphrase to encrypt the credentials (leave blank to skip encryption): "
+            read -s PASSPHRASE
+            echo
+
+            if [ -z "$PASSPHRASE" ]; then
+                warning "Encryption skipped. Credentials are stored in plain text at $CREDENTIALS_FILE."
+                break
+            fi
+
+            prompt "Confirm your passphrase: "
+            read -s PASSPHRASE_CONFIRM
+            echo
+
+            if [ "$PASSPHRASE" != "$PASSPHRASE_CONFIRM" ]; then
+                error "Passphrases do not match. Please try again."
             else
-                warning "gpg not found. Installing it now..."
-                apt-get install -y gnupg
+                info "Encrypting credentials file with gpg for security..."
                 if gpg --batch --yes --passphrase "$PASSPHRASE" -c "$CREDENTIALS_FILE"; then
                     rm "$CREDENTIALS_FILE"
                     success "Credentials saved and encrypted at $CREDENTIALS_FILE.gpg."
@@ -2970,10 +3494,9 @@ save_credentials() {
                 else
                     error "Failed to encrypt credentials file. The file remains unencrypted."
                 fi
+                break  # Exit loop after successful encryption
             fi
-        else
-            warning "Encryption skipped. Credentials are stored in plain text at $CREDENTIALS_FILE."
-        fi
+        done
     else
         info "Non-interactive mode detected. Credentials saved in plaintext for automation."
     fi
@@ -2995,9 +3518,17 @@ update_firefly() {
     if [ "$NON_INTERACTIVE" = true ]; then
         CONFIRM_UPDATE="Y"
     else
-        prompt "Do you want to proceed with the update? (y/N): "
-        read CONFIRM_UPDATE
-        CONFIRM_UPDATE=${CONFIRM_UPDATE:-N}
+        while true; do
+            prompt "Do you want to proceed with the update? (y/N): "
+            read CONFIRM_UPDATE
+            CONFIRM_UPDATE=${CONFIRM_UPDATE:-N}
+
+            if validate_input "$CONFIRM_UPDATE" "yes_no"; then
+                break
+            else
+                error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            fi
+        done
     fi
 
     if [[ "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
@@ -3006,11 +3537,7 @@ update_firefly() {
         # Step 2: Create a backup of the current installation
         create_backup "$FIREFLY_INSTALL_DIR"
 
-        # Step 3: Update package lists
-        info "Updating package lists..."
-        apt update
-
-        # Step 4: Detect the current PHP version
+        # Step 3: Detect the current PHP version
         if command -v php &>/dev/null; then
             CURRENT_PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION.'.'.PHP_RELEASE_VERSION;")
             info "PHP is currently installed with version: $CURRENT_PHP_VERSION"
@@ -3019,7 +3546,7 @@ update_firefly() {
             return 1
         fi
 
-        # Step 5: Get the latest release tag for Firefly III
+        # Step 4: Get the latest release tag for Firefly III
         LATEST_TAG=$(curl -s https://api.github.com/repos/firefly-iii/firefly-iii/releases/latest | grep "tag_name" | cut -d '"' -f 4)
         
         if [ -z "$LATEST_TAG" ]; then
@@ -3029,7 +3556,7 @@ update_firefly() {
         
         info "Latest Firefly III release is $LATEST_TAG"
         
-        # Step 6: Check PHP compatibility and download appropriate version
+        # Step 5: Check PHP compatibility and download appropriate version
         if ! check_php_compatibility "$LATEST_TAG" "$CURRENT_PHP_VERSION"; then
             # If a compatible Firefly III version was found, use it
             if [ -n "$FIREFLY_RELEASE_TAG" ]; then
@@ -3056,10 +3583,10 @@ update_firefly() {
             archive_file=$(ls "$FIREFLY_TEMP_DIR"/*.zip | head -n 1)
         fi
 
-        # Step 7: Extract the archive file
+        # Step 6: Extract the archive file
         extract_archive "$archive_file" "$FIREFLY_TEMP_DIR" || return 1
 
-        # Step 8: Copy over the .env file
+        # Step 7: Copy over the .env file
         info "Copying configuration files..."
         if [ -f "$FIREFLY_INSTALL_DIR/.env" ]; then
             cp "$FIREFLY_INSTALL_DIR/.env" "$FIREFLY_TEMP_DIR/.env"
@@ -3085,21 +3612,21 @@ update_firefly() {
             fi
         fi
 
-        # Step 9: Set permissions for the rest of the files in the temp directory
+        # Step 8: Set permissions for the rest of the files in the temp directory
         info "Setting permissions..."
         chown -R www-data:www-data "$FIREFLY_TEMP_DIR"
         chmod -R 775 "$FIREFLY_TEMP_DIR/storage"
 
-        # Step 10: Move the old installation and replace with new
+        # Step 9: Move the old installation and replace with new
         info "Moving old installation to ${FIREFLY_INSTALL_DIR}-old"
         mv "$FIREFLY_INSTALL_DIR" "${FIREFLY_INSTALL_DIR}-old"
         mv "$FIREFLY_TEMP_DIR" "$FIREFLY_INSTALL_DIR"
 
-        # Step 11: Set ownership and permissions for the new installation
+        # Step 10: Set ownership and permissions for the new installation
         chown -R www-data:www-data "$FIREFLY_INSTALL_DIR"
         chmod -R 775 "$FIREFLY_INSTALL_DIR/storage"
 
-        # Step 12: Run composer install to update dependencies
+        # Step 11: Run composer install to update dependencies
         info "Ensuring Composer cache directory exists..."
         mkdir -p /var/www/.cache/composer/files/
         chown -R www-data:www-data /var/www/.cache/composer
@@ -3114,27 +3641,27 @@ update_firefly() {
             handle_update_failure || return 1
         fi
 
-        # Step 13: Setup APP key
+        # Step 12: Setup APP key
         setup_app_key || {
             handle_update_failure || return 1
         }
 
-        # Step 14: Run database migrations
+        # Step 13: Run database migrations
         run_database_migrations || {
             handle_update_failure || return 1
         }
 
-        # Step 15: Update database schema
+        # Step 14: Update database schema
         update_database_schema || {
             handle_update_failure || return 1
         }
 
-        # Step 16: Install Laravel Passport if needed
+        # Step 15: Install Laravel Passport if needed
         install_laravel_passport || {
             handle_update_failure || return 1
         }
 
-        # Step 17: Configure Apache for Firefly III
+        # Step 16: Configure Apache for Firefly III
         if [ "$HAS_DOMAIN" = true ]; then
             configure_apache "$DOMAIN_NAME" "$FIREFLY_INSTALL_DIR" true || return 1
         else
@@ -3159,20 +3686,27 @@ update_firefly() {
 handle_update_failure() {
     # Offer to restore from backup
     if [ "$NON_INTERACTIVE" = false ]; then
-        prompt "Update process failed. Would you like to restore from backup? (Y/n): "
-        read RESTORE_BACKUP
-        RESTORE_BACKUP=${RESTORE_BACKUP:-Y}
-        
-        if [[ "$RESTORE_BACKUP" =~ ^[Yy]$ ]]; then
-            info "Restoring from backup..."
-            rm -rf "$FIREFLY_INSTALL_DIR"
-            mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
-            success "Restored previous installation."
-            return 0
-        else
-            warning "Not restoring from backup. The installation may be in an inconsistent state."
-            return 1
-        fi
+        while true; do
+            prompt "Update process failed. Would you like to restore from backup? (Y/n): "
+            read RESTORE_BACKUP
+            RESTORE_BACKUP=${RESTORE_BACKUP:-Y}  # Default to 'Y' if no input
+
+            if validate_input "$RESTORE_BACKUP" "yes_no"; then
+                if [[ "$RESTORE_BACKUP" =~ ^[Yy]$ ]]; then
+                    info "Restoring from backup..."
+                    rm -rf "$FIREFLY_INSTALL_DIR"
+                    mv "${FIREFLY_INSTALL_DIR}-old" "$FIREFLY_INSTALL_DIR"
+                    success "Restored previous installation."
+                    return 0
+                else
+                    warning "Not restoring from backup. The installation may be in an inconsistent state."
+                    return 1
+                fi
+                break  # Exit loop once valid input is provided
+            else
+                error "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            fi
+        done
     else
         info "Non-interactive mode: Automatically restoring from backup..."
         rm -rf "$FIREFLY_INSTALL_DIR"
@@ -3248,64 +3782,11 @@ server_ip=$(hostname -I | awk '{print $1}')
 # Trap exit to ensure cleanup and display log location even on failure
 trap 'cleanup; echo -e "${COLOR_YELLOW}Log file for this run: ${LOG_FILE}${COLOR_RESET}"; echo -e "${COLOR_YELLOW}For troubleshooting, check the log at: ${LOG_FILE}${COLOR_RESET}";' EXIT
 
-# Update package lists once
-apt-get update
-apt-get full-upgrade -y
-for cmd in curl jq wget unzip openssl gpg; do # Add gpg here
-    if ! command -v $cmd &>/dev/null; then
-        warning "Command '$cmd' is missing. Installing it now..."
-        apt-get install -y $cmd || {
-            error "Failed to install '$cmd'. Please install it manually and re-run the script."
-            return 1
-        }
-    fi
-done
-
-# Check if Apache is installed to use 'apachectl' instead of a2query
-if ! command -v apachectl &>/dev/null; then
-    info "Apache is not installed. Proceeding to install Apache..."
-    apt-get install -y apache2 || {
-        error "Failed to install Apache. Please check your network connection and package manager settings, and then try installing Apache manually with 'apt-get install apache2'."
-        return 1
-    }
-
-    # Start Apache after installation
-    info "Starting Apache service..."
-    systemctl start apache2 || {
-        error "Failed to start Apache. Please check the system logs for more details and manually start the service using 'systemctl start apache2'."
-        return 1
-    }
-
-    success "Apache installed and started successfully."
-else
-    apachectl configtest &>/dev/null || {
-        error "Apache is installed but the configuration is incorrect. Please check '/etc/apache2/apache2.conf' or run 'apachectl configtest' to identify issues."
-
-        # Check for non-interactive mode
-        if [ "$NON_INTERACTIVE" = true ]; then
-            error "Apache configuration issues must be fixed manually in non-interactive mode. Exiting."
-            return 1
-        fi
-
-        # Ask if the user wants to retry in interactive mode
-        prompt "Do you want to try fixing the configuration and retry? (Y/n): "
-        read RETRY_APACHE
-        RETRY_APACHE=${RETRY_APACHE:-Y}
-
-        if [[ "$RETRY_APACHE" =~ ^[Yy]$ ]]; then
-            info "Retrying Apache configuration test..."
-            apachectl configtest || {
-                error "Apache configuration test failed again. Please resolve the issue and re-run the script."
-                return 1
-            }
-        else
-            error "Apache configuration issues must be fixed before proceeding. Exiting."
-            return 1
-        fi
-    }
-
-    success "Apache is already installed and configured correctly."
-fi
+# Call the main preparation function
+prepare_system || {
+    error "System preparation failed. Please check the errors above and resolve any issues before continuing."
+    exit 1
+}
 
 # Ensure directories exist and are writable
 for dir in "$FIREFLY_INSTALL_DIR" "$IMPORTER_INSTALL_DIR"; do
